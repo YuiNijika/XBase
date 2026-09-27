@@ -260,7 +260,7 @@ bool EnsureRuntime(HMODULE module, DetectedGame game, const std::string& hostNam
     const XBaseRuntime* table = getRuntime(XBASE_ABI_VERSION);
     // 共享库只追加字段，拿到比自己头文件更长的表是正常情况，新字段用 size 判断；
     // 共享库的 ABI 比本 mod 的头文件更新也可以用，只有更旧才真的缺能力
-    if (!table || table->size < sizeof(XBaseRuntime) || table->abiVersion > XBASE_ABI_VERSION) {
+    if (!table || table->size < sizeof(XBaseRuntime) || table->abiVersion < XBASE_ABI_VERSION) {
         const std::string message = std::string(
             "The XBase shared runtime was built for a different ABI version.\n\n"
             "This mod requires XBase ")

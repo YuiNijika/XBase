@@ -212,6 +212,7 @@ if /i "%CONFIG%"=="Release" (
     call :stage_sdk "..\III.VC.SA.WebView2"
     rem example 是 XBase 自己的子目录，不是兄弟工程，路径不带上级
     call :stage_sdk "example"
+    call :stage_panel
 )
 
 rem 查看器与 SDK 一起构建，产物落在 viewer\build\bin\XBase.exe
@@ -295,6 +296,25 @@ if exist "include\webview2\x86\WebView2Loader.dll" (
     echo [Warning] include\webview2\x86\WebView2Loader.dll not found; WebView feature will be unavailable.
 )
 echo [Info] Staged Release SDK to %SDK_TARGET%\include\XBase and %SDK_TARGET%\lib
+exit /b 0
+
+rem ============================================================
+rem Stage the built React panel into the runtime library folder.
+rem The panel ships with XBase, mods only mount into it.
+rem ============================================================
+:stage_panel
+set "PANEL_DIST=%~dp0panel\dist"
+if not exist "%PANEL_DIST%\index.html" (
+    echo [Warning] panel\dist\index.html not found; run "npm install" and "npm run build" inside panel first.
+    exit /b 0
+)
+if not exist "build\bin\%CONFIG%\XBase\Library\panel" mkdir "build\bin\%CONFIG%\XBase\Library\panel"
+xcopy "%PANEL_DIST%\*" "build\bin\%CONFIG%\XBase\Library\panel\" /Y /Q /E >nul
+if errorlevel 1 (
+    echo [Error] Failed to stage the React panel.
+    exit /b 1
+)
+echo [Info] Staged React panel to build\bin\%CONFIG%\XBase\Library\panel
 exit /b 0
 
 :find_premake

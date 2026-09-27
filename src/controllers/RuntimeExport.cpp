@@ -10,6 +10,8 @@
 #include <XBase/UI.h>
 #include <XBase/Version.h>
 
+#include "PanelAbi.h"
+
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -277,6 +279,46 @@ std::uint32_t VersionNumber() {
     return XBase::kVersionNumber;
 }
 
+int PanelMount(const char* specJson) {
+    return XBase::Panel::Abi::MountJson(specJson);
+}
+
+void PanelUnmount(const char* modId) {
+    XBase::Panel::Abi::UnmountName(modId);
+}
+
+int PanelBindValue(const char* controlId, double (*read)(void*), void (*write)(double, void*), void* userData) {
+    return XBase::Panel::Abi::BindValueRaw(controlId, read, write, userData);
+}
+
+int PanelBindAction(const char* controlId, void (*run)(void*), void* userData) {
+    return XBase::Panel::Abi::BindActionRaw(controlId, run, userData);
+}
+
+void PanelNotifyChanged(const char* controlId, double value) {
+    XBase::Panel::Abi::NotifyChangedName(controlId, value);
+}
+
+int PanelAvailable() {
+    return XBase::Panel::Abi::Available();
+}
+
+void PanelShow(const char* modId) {
+    XBase::Panel::Abi::ShowName(modId);
+}
+
+void PanelHide() {
+    XBase::Panel::Abi::HideName();
+}
+
+int PanelIsVisible() {
+    return XBase::Panel::Abi::IsVisibleRaw();
+}
+
+void PanelSetHotkey(int key, unsigned int modifiers) {
+    XBase::Panel::Abi::SetHotkeyRaw(key, modifiers);
+}
+
 XBaseRuntime BuildTable() {
     XBaseRuntime table{};
     table.size = sizeof(XBaseRuntime);
@@ -327,6 +369,16 @@ XBaseRuntime BuildTable() {
     table.drawText = &DrawText;
     table.versionString = &VersionString;
     table.versionNumber = &VersionNumber;
+    table.panelMount = &PanelMount;
+    table.panelUnmount = &PanelUnmount;
+    table.panelBindValue = &PanelBindValue;
+    table.panelBindAction = &PanelBindAction;
+    table.panelNotifyChanged = &PanelNotifyChanged;
+    table.panelAvailable = &PanelAvailable;
+    table.panelShow = &PanelShow;
+    table.panelHide = &PanelHide;
+    table.panelIsVisible = &PanelIsVisible;
+    table.panelSetHotkey = &PanelSetHotkey;
     return table;
 }
 

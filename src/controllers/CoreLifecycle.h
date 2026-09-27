@@ -16,6 +16,7 @@
 #include <XBase/Cheats.h>
 #include <XBase/VehicleEffects.h>
 #include <XBase/WebView.h>
+#include <XBase/Panel.h>
 
 #include <cstddef>
 #include <iterator>
@@ -53,6 +54,8 @@ inline const DomainLifecycle kDomains[] = {
     {Domain::Cheats,       Cheats::Init,       Initialized,                  Cheats::NotifyGameInit,  Cheats::Process,       Cheats::Shutdown},
     {Domain::VehicleEffects, VehicleEffects::Init, Initialized,              VehicleEffects::NotifyGameInit, VehicleEffects::Process, VehicleEffects::Shutdown},
     {Domain::WebView,      WebViewDomainInit, WebView::IsInitialized,       WebView::NotifyGameInit, WebView::Process,     WebView::Shutdown},
+    // 面板只在打开时才建网页视图，域本身只负责标记就绪与轮询热键
+    {Domain::Panel,        Panel::Init,       Panel::IsInitialized,         Panel::NotifyGameInit,   Panel::Process,        Panel::Shutdown},
 };
 
 inline bool IsEnabled(DomainMask mask, Domain domain) {
@@ -75,6 +78,7 @@ inline Capability DomainCapability(Domain domain) {
     case Domain::Cheats: return Capability::Cheats;
     case Domain::VehicleEffects: return Capability::VehicleEffects;
     case Domain::WebView: return Capability::WebView;
+    case Domain::Panel: return Capability::Panel;
     }
     return Capability::Player;
 }

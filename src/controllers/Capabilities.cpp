@@ -16,6 +16,7 @@ CapabilitySupport GetCapabilitySupport(Capability capability) {
     case Capability::Hooks:
     case Capability::Ui:
     case Capability::WebView:
+    case Capability::Panel:
         return CapabilitySupport::Supported;
     case Capability::Ped:
     case Capability::World:
@@ -43,6 +44,7 @@ CapabilitySupport GetCapabilitySupport(Capability capability) {
     case Capability::Hooks:
     case Capability::Ui:
     case Capability::WebView:
+    case Capability::Panel:
         return CapabilitySupport::Supported;
     default:
         return CapabilitySupport::Unsupported;
@@ -67,6 +69,7 @@ CapabilitySupport GetCapabilitySupport(Capability capability) {
     case Capability::Hooks:
     case Capability::Ui:
     case Capability::WebView:
+    case Capability::Panel:
         return CapabilitySupport::Supported;
     default:
         return CapabilitySupport::Unsupported;

@@ -1,0 +1,792 @@
+#include <XBase/Panel.h>
+
+#include "PanelAbi.h"
+
+#include <XBase/Abi.h>
+#include <XBase/Capabilities.h>
+#include <XBase/Hooks.h>
+#include <XBase/Json.h>
+#include <XBase/Log.h>
+#include <XBase/Platform.h>
+#include <XBase/Runtime.h>
+#include <XBase/UI.h>
+#include <XBase/Version.h>
+#include <XBase/WebBridge.h>
+#include <XBase/WebView.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if !defined(XBASE_RUNTIME_DLL)
+// 只有 mod 侧编得到 Bootstrap，共享运行时自己就是函数表的持有者
+#include "../Bootstrap.h"
+#endif
+
+namespace XBase::Panel {
+namespace {
+
+constexpr const char* kVirtualHost = "xbase.panel";
+constexpr const char* kPageFile = "index.html";
+constexpr const char* kPanelFolder = "Library\\panel\\";
+
+struct Binding {
+    ValueRead read;
+    ValueWrite write;
+    ActionFn run;
+};
+
+struct ModEntry {
+    ModSpec spec;
+    std::unordered_map<std::string, Binding> bindings;
+};
+
+std::mutex g_mutex;
+std::vector<ModEntry> g_mods;
+bool g_initialized = false;
+bool g_navigated = false;
+std::string g_activeModId;
+Input::Hotkey g_hotkey{Input::Key::F8, 0};
+Rect g_bounds{};
+bool g_boundsReady = false;
+
+// 共享运行时比 mod 的头文件旧时没有这一段，此时退回本地注册表，
+// 结果是每个模块各持一份面板，功能还在但不再聚合
+bool HasPanelSection(const XBaseRuntime* table) {
+    return table != nullptr
+        && table->size >= XBASE_ABI_PANEL_OFFSET + sizeof(void*)
+        && table->panelMount != nullptr;
+}
+
+const XBaseRuntime* RuntimeTable() {
+#if defined(XBASE_RUNTIME_DLL)
+    return nullptr;
+#else
+    const XBaseRuntime* table = Bootstrap::GetRuntimeTable();
+    return HasPanelSection(table) ? table : nullptr;
+#endif
+}
+
+std::string PanelDirectory() {
+    return Platform::XBaseDirectory() + kPanelFolder;
+}
+
+bool CapabilityOk(const std::optional<FeatureCapability>& capability) {
+    if (!capability) return true;
+    return HasCapability(*capability);
+}
+
+bool MatchesGame(const std::vector<std::string>& games) {
+    if (games.empty()) return true;
+    const std::string current = Runtime::GetGameKey();
+    return std::find(games.begin(), games.end(), current) != games.end();
+}
+
+const char* KindName(ControlKind kind) {
+    switch (kind) {
+    case ControlKind::Toggle: return "toggle";
+    case ControlKind::Float: return "float";
+    case ControlKind::Int: return "int";
+    case ControlKind::Action: return "action";
+    case ControlKind::Select: return "select";
+    }
+    return "toggle";
+}
+
+ControlKind KindFromName(const std::string& name) {
+    if (name == "float") return ControlKind::Float;
+    if (name == "int") return ControlKind::Int;
+    if (name == "action") return ControlKind::Action;
+    if (name == "select") return ControlKind::Select;
+    return ControlKind::Toggle;
+}
+
+Json::Value CapabilityJson(const std::optional<FeatureCapability>& capability) {
+    return Json::Value(static_cast<double>(capability ? static_cast<int>(*capability) : -1));
+}
+
+std::optional<FeatureCapability> CapabilityFromJson(const Json::Value& value) {
+    if (!value.IsNumber()) return std::nullopt;
+    const int code = value.AsInt(-1);
+    if (code < 0) return std::nullopt;
+    return static_cast<FeatureCapability>(code);
+}
+
+Json::Value StringsJson(const std::vector<std::string>& values) {
+    Json::Value result;
+    for (const std::string& value : values) {
+        result.Push(Json::Value(value));
+    }
+    return result;
+}
+
+std::vector<std::string> StringsFromJson(const Json::Value& value) {
+    std::vector<std::string> result;
+    if (!value.IsArray()) return result;
+    for (std::size_t i = 0; i < value.Size(); ++i) {
+        result.push_back(value[i].AsString());
+    }
+    return result;
+}
+
+Json::Value SerializeControl(const Control& control) {
+    Json::Value value;
+    value.Set("id", Json::Value(control.id));
+    value.Set("kind", Json::Value(std::string(KindName(control.kind))));
+    value.Set("label", Json::Value(control.label));
+    value.Set("hint", Json::Value(control.hint));
+    value.Set("enabled", Json::Value(CapabilityOk(control.capability)));
+    value.Set("bounded", Json::Value(control.bounded));
+    value.Set("min", Json::Value(control.min));
+    value.Set("max", Json::Value(control.max));
+    value.Set("step", Json::Value(control.step));
+    value.Set("format", Json::Value(control.format));
+    value.Set("visibleWhen", Json::Value(control.visibleWhen));
+
+    if (!control.options.empty()) {
+        Json::Value options;
+        for (const Option& option : control.options) {
+            Json::Value item;
+            item.Set("value", Json::Value(option.value));
+            item.Set("label", Json::Value(option.label));
+            options.Push(item);
+        }
+        value.Set("options", options);
+    }
+    return value;
+}
+
+Control ParseControl(const Json::Value& value) {
+    Control control;
+    control.kind = KindFromName(value["kind"].AsString("toggle"));
+    control.id = value["id"].AsString();
+    control.label = value["label"].AsString();
+    control.hint = value["hint"].AsString();
+    control.capability = CapabilityFromJson(value["capability"]);
+    control.bounded = value["bounded"].AsBool(false);
+    control.min = value["min"].AsNumber(0.0);
+    control.max = value["max"].AsNumber(0.0);
+    control.step = value["step"].AsNumber(0.0);
+    control.format = value["format"].AsString();
+    control.visibleWhen = value["visibleWhen"].AsString();
+
+    const Json::Value& options = value["options"];
+    if (options.IsArray()) {
+        for (std::size_t i = 0; i < options.Size(); ++i) {
+            Option option;
+            option.value = options[i]["value"].AsString();
+            option.label = options[i]["label"].AsString();
+            control.options.push_back(std::move(option));
+        }
+    }
+    return control;
+}
+
+Json::Value SerializeSection(const Section& section) {
+    Json::Value value;
+    value.Set("id", Json::Value(section.id));
+    value.Set("label", Json::Value(section.label));
+    value.Set("hint", Json::Value(section.hint));
+    value.Set("columns", Json::Value(static_cast<double>(section.columns)));
+    value.Set("inline", Json::Value(section.inlineLayout));
+    value.Set("enabled", Json::Value(CapabilityOk(section.capability)));
+
+    Json::Value controls;
+    for (const Control& control : section.controls) {
+        if (!MatchesGame(control.games)) continue;
+        controls.Push(SerializeControl(control));
+    }
+    value.Set("controls", controls);
+    return value;
+}
+
+Section ParseSection(const Json::Value& value) {
+    Section section;
+    section.id = value["id"].AsString();
+    section.label = value["label"].AsString();
+    section.hint = value["hint"].AsString();
+    section.columns = value["columns"].AsInt(1);
+    section.inlineLayout = value["inline"].AsBool(false);
+    section.capability = CapabilityFromJson(value["capability"]);
+
+    const Json::Value& controls = value["controls"];
+    if (controls.IsArray()) {
+        for (std::size_t i = 0; i < controls.Size(); ++i) {
+            section.controls.push_back(ParseControl(controls[i]));
+        }
+    }
+    return section;
+}
+
+Json::Value SerializeMod(const ModEntry& entry) {
+    Json::Value value;
+    value.Set("id", Json::Value(entry.spec.modId));
+    value.Set("title", Json::Value(entry.spec.title));
+    value.Set("subtitle", Json::Value(entry.spec.subtitle));
+    value.Set("version", Json::Value(entry.spec.version));
+
+    Json::Value pages;
+    for (const Page& page : entry.spec.pages) {
+        Json::Value pageValue;
+        pageValue.Set("id", Json::Value(page.id));
+        pageValue.Set("label", Json::Value(page.label));
+
+        Json::Value sections;
+        for (const Section& section : page.sections) {
+            const Json::Value sectionValue = SerializeSection(section);
+            // 整块被版本筛空时不下发，网页端不必再判断一次
+            if (sectionValue["controls"].Size() > 0) {
+                sections.Push(sectionValue);
+            }
+        }
+        pageValue.Set("sections", sections);
+        pages.Push(pageValue);
+    }
+    value.Set("pages", pages);
+    return value;
+}
+
+Json::Value SchemaJson() {
+    Json::Value result;
+    result.Set("game", Json::Value(std::string(Runtime::GetGameKey())));
+    result.Set("gameName", Json::Value(std::string(Runtime::GetGameName())));
+    result.Set("version", Json::Value(std::string(kVersionString)));
+    result.Set("activeModId", Json::Value(g_activeModId));
+
+    Json::Value mods;
+    for (const ModEntry& entry : g_mods) {
+        mods.Push(SerializeMod(entry));
+    }
+    result.Set("mods", mods);
+    return result;
+}
+
+Binding* FindBinding(const std::string& controlId) {
+    for (ModEntry& entry : g_mods) {
+        const auto found = entry.bindings.find(controlId);
+        if (found != entry.bindings.end()) return &found->second;
+    }
+    return nullptr;
+}
+
+Json::Value OkValue() {
+    Json::Value value;
+    value.Set("ok", Json::Value(true));
+    return value;
+}
+
+Json::Value FailedValue(const std::string& error) {
+    Json::Value value;
+    value.Set("ok", Json::Value(false));
+    value.Set("error", Json::Value(error));
+    return value;
+}
+
+Json::Value OnSchema(const Json::Value&) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return SchemaJson();
+}
+
+Json::Value OnGet(const Json::Value& params) {
+    const std::string id = params["id"].AsString();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const Binding* binding = FindBinding(id);
+    if (!binding || !binding->read) {
+        return FailedValue("未绑定的控件: " + id);
+    }
+
+    Json::Value result;
+    result.Set("ok", Json::Value(true));
+    result.Set("value", Json::Value(binding->read()));
+    return result;
+}
+
+Json::Value OnSet(const Json::Value& params) {
+    const std::string id = params["id"].AsString();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(id);
+    if (!binding || !binding->write) {
+        return FailedValue("未绑定的控件: " + id);
+    }
+
+    const Json::Value& value = params["value"];
+    const double next = value.IsBool() ? (value.AsBool() ? 1.0 : 0.0) : value.AsNumber(0.0);
+    binding->write(next);
+    return OkValue();
+}
+
+Json::Value OnRun(const Json::Value& params) {
+    const std::string id = params["id"].AsString();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(id);
+    if (!binding || !binding->run) {
+        return FailedValue("未绑定的控件: " + id);
+    }
+    binding->run();
+    return OkValue();
+}
+
+Json::Value OnHide(const Json::Value&) {
+    Hide();
+    return OkValue();
+}
+
+Rect EnsureBounds() {
+    if (g_boundsReady && g_bounds.right > g_bounds.left && g_bounds.bottom > g_bounds.top) {
+        return g_bounds;
+    }
+
+    const Vec2 display = UI::GetDisplaySize();
+    const float width = display.x * 0.62f;
+    const float height = display.y * 0.80f;
+    g_bounds = Rect{(display.x - width) * 0.5f, (display.y - height) * 0.5f,
+                    (display.x - width) * 0.5f + width, (display.y - height) * 0.5f + height};
+    g_boundsReady = true;
+    return g_bounds;
+}
+
+Json::Value OnSetSize(const Json::Value& params) {
+    const Rect current = EnsureBounds();
+    const float width = static_cast<float>(params["width"].AsNumber(current.right - current.left));
+    const float height = static_cast<float>(params["height"].AsNumber(current.bottom - current.top));
+    g_bounds = Rect{current.left, current.top, current.left + width, current.top + height};
+    WebView::SetBounds(g_bounds);
+    return OkValue();
+}
+
+Json::Value OnSetPos(const Json::Value& params) {
+    const Rect current = EnsureBounds();
+    const float x = static_cast<float>(params["x"].AsNumber(current.left));
+    const float y = static_cast<float>(params["y"].AsNumber(current.top));
+    const float width = current.right - current.left;
+    const float height = current.bottom - current.top;
+    g_bounds = Rect{x, y, x + width, y + height};
+    WebView::SetBounds(g_bounds);
+    return OkValue();
+}
+
+Json::Value OnRect(const Json::Value&) {
+    const Rect current = EnsureBounds();
+    Json::Value result;
+    result.Set("x", Json::Value(static_cast<double>(current.left)));
+    result.Set("y", Json::Value(static_cast<double>(current.top)));
+    result.Set("width", Json::Value(static_cast<double>(current.right - current.left)));
+    result.Set("height", Json::Value(static_cast<double>(current.bottom - current.top)));
+    return result;
+}
+
+void InstallBridge() {
+    WebBridge::Install();
+    WebBridge::RegisterMethod("panel.schema", OnSchema);
+    WebBridge::RegisterMethod("panel.get", OnGet);
+    WebBridge::RegisterMethod("panel.set", OnSet);
+    WebBridge::RegisterMethod("panel.run", OnRun);
+    WebBridge::RegisterMethod("panel.hide", OnHide);
+    WebBridge::RegisterMethod("panel.setSize", OnSetSize);
+    WebBridge::RegisterMethod("panel.setPos", OnSetPos);
+    WebBridge::RegisterMethod("panel.rect", OnRect);
+}
+
+void UninstallBridge() {
+    WebBridge::UnregisterMethod("panel.schema");
+    WebBridge::UnregisterMethod("panel.get");
+    WebBridge::UnregisterMethod("panel.set");
+    WebBridge::UnregisterMethod("panel.run");
+    WebBridge::UnregisterMethod("panel.hide");
+    WebBridge::UnregisterMethod("panel.setSize");
+    WebBridge::UnregisterMethod("panel.setPos");
+    WebBridge::UnregisterMethod("panel.rect");
+}
+
+void RemoveMod(const std::string& modId) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_mods.erase(
+        std::remove_if(g_mods.begin(), g_mods.end(),
+                       [&modId](const ModEntry& entry) { return entry.spec.modId == modId; }),
+        g_mods.end());
+}
+
+// --- mod 侧转发用的跳板 ---
+// std::function 不能直接过 C 接口，这里把持有者留在 mod 自己的堆上，
+// 函数表里只放一个函数指针加一个不透明的 userData
+
+double TrampolineRead(void* userData) {
+    const auto* binding = static_cast<const Binding*>(userData);
+    return binding && binding->read ? binding->read() : 0.0;
+}
+
+void TrampolineWrite(double value, void* userData) {
+    const auto* binding = static_cast<const Binding*>(userData);
+    if (binding && binding->write) binding->write(value);
+}
+
+void TrampolineRun(void* userData) {
+    const auto* binding = static_cast<const Binding*>(userData);
+    if (binding && binding->run) binding->run();
+}
+
+std::mutex g_ownedMutex;
+std::vector<std::pair<std::string, std::unique_ptr<Binding>>> g_owned;
+
+Binding* OwnBinding(const std::string& controlId) {
+    auto owned = std::make_unique<Binding>();
+    Binding* raw = owned.get();
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    g_owned.emplace_back(controlId, std::move(owned));
+    return raw;
+}
+
+void ReleaseOwned(const std::string& modId) {
+    const std::string prefix = modId + ".";
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    g_owned.erase(
+        std::remove_if(g_owned.begin(), g_owned.end(),
+                       [&prefix](const std::pair<std::string, std::unique_ptr<Binding>>& item) {
+                           return item.first.compare(0, prefix.size(), prefix) == 0;
+                       }),
+        g_owned.end());
+}
+
+Json::Value SpecJson(const ModSpec& spec) {
+    Json::Value value;
+    value.Set("modId", Json::Value(spec.modId));
+    value.Set("title", Json::Value(spec.title));
+    value.Set("subtitle", Json::Value(spec.subtitle));
+    value.Set("version", Json::Value(spec.version));
+
+    Json::Value pages;
+    for (const Page& page : spec.pages) {
+        Json::Value pageValue;
+        pageValue.Set("id", Json::Value(page.id));
+        pageValue.Set("label", Json::Value(page.label));
+
+        Json::Value sections;
+        for (const Section& section : page.sections) {
+            Json::Value sectionValue;
+            sectionValue.Set("id", Json::Value(section.id));
+            sectionValue.Set("label", Json::Value(section.label));
+            sectionValue.Set("hint", Json::Value(section.hint));
+            sectionValue.Set("columns", Json::Value(static_cast<double>(section.columns)));
+            sectionValue.Set("inline", Json::Value(section.inlineLayout));
+            sectionValue.Set("capability", CapabilityJson(section.capability));
+
+            Json::Value controls;
+            for (const Control& control : section.controls) {
+                Json::Value controlValue = SerializeControl(control);
+                // 网页端要的是写好的 enabled，能力编码只是过桥用的
+                controlValue.Set("capability", CapabilityJson(control.capability));
+                controlValue.Set("games", StringsJson(control.games));
+                controls.Push(controlValue);
+            }
+            sectionValue.Set("controls", controls);
+            sections.Push(sectionValue);
+        }
+        pageValue.Set("sections", sections);
+        pages.Push(pageValue);
+    }
+    value.Set("pages", pages);
+    return value;
+}
+
+ModSpec SpecFromJson(const Json::Value& value) {
+    ModSpec spec;
+    spec.modId = value["modId"].AsString();
+    spec.title = value["title"].AsString();
+    spec.subtitle = value["subtitle"].AsString();
+    spec.version = value["version"].AsString();
+
+    const Json::Value& pages = value["pages"];
+    if (!pages.IsArray()) return spec;
+
+    for (std::size_t i = 0; i < pages.Size(); ++i) {
+        Page page;
+        page.id = pages[i]["id"].AsString();
+        page.label = pages[i]["label"].AsString();
+        const Json::Value& sections = pages[i]["sections"];
+        if (sections.IsArray()) {
+            for (std::size_t j = 0; j < sections.Size(); ++j) {
+                Section section = ParseSection(sections[j]);
+                const Json::Value& controls = sections[j]["controls"];
+                if (controls.IsArray()) {
+                    for (std::size_t k = 0; k < controls.Size(); ++k) {
+                        Control control = ParseControl(controls[k]);
+                        control.games = StringsFromJson(controls[k]["games"]);
+                        section.controls.push_back(std::move(control));
+                    }
+                }
+                page.sections.push_back(std::move(section));
+            }
+        }
+        spec.pages.push_back(std::move(page));
+    }
+    return spec;
+}
+
+} // namespace
+
+bool Mount(const ModSpec& spec) {
+    if (spec.modId.empty()) {
+        Log::Warn("Panel: 挂载缺 modId，已忽略");
+        return false;
+    }
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        return table->panelMount(SpecJson(spec).Serialize(false).c_str()) != 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (ModEntry& entry : g_mods) {
+        if (entry.spec.modId == spec.modId) {
+            entry.spec = spec;
+            entry.bindings.clear();
+            return true;
+        }
+    }
+    g_mods.push_back(ModEntry{spec, {}});
+    return true;
+}
+
+void Unmount(const std::string& modId) {
+    if (modId.empty()) return;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        table->panelUnmount(modId.c_str());
+        ReleaseOwned(modId);
+        return;
+    }
+    RemoveMod(modId);
+}
+
+bool BindValue(const std::string& controlId, ValueRead read, ValueWrite write) {
+    if (controlId.empty()) return false;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        Binding* binding = OwnBinding(controlId);
+        binding->read = std::move(read);
+        binding->write = std::move(write);
+        return table->panelBindValue(controlId.c_str(), &TrampolineRead, &TrampolineWrite, binding) != 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) {
+        Log::Warn(std::string("Panel: 控件未登记就绑定 ") + controlId);
+        return false;
+    }
+    binding->read = std::move(read);
+    binding->write = std::move(write);
+    return true;
+}
+
+bool BindAction(const std::string& controlId, ActionFn run) {
+    if (controlId.empty()) return false;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        Binding* binding = OwnBinding(controlId);
+        binding->run = std::move(run);
+        return table->panelBindAction(controlId.c_str(), &TrampolineRun, binding) != 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) {
+        Log::Warn(std::string("Panel: 控件未登记就绑定 ") + controlId);
+        return false;
+    }
+    binding->run = std::move(run);
+    return true;
+}
+
+void NotifyChanged(const std::string& controlId, double value) {
+    if (controlId.empty()) return;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        table->panelNotifyChanged(controlId.c_str(), value);
+        return;
+    }
+
+    Json::Value payload;
+    payload.Set("id", Json::Value(controlId));
+    payload.Set("value", Json::Value(value));
+    WebBridge::Emit("panel.changed", payload);
+}
+
+bool IsAvailable() {
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) return table->panelAvailable() != 0;
+    return WebView::IsRuntimeAvailable() && Platform::FileExists(PanelDirectory() + kPageFile);
+}
+
+bool Show(const std::string& modId) {
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        table->panelShow(modId.c_str());
+        return true;
+    }
+
+    if (!WebView::IsRuntimeAvailable()) {
+        Log::Error("Panel: 本机没有可用的网页视图运行时");
+        return false;
+    }
+
+    const std::string directory = PanelDirectory();
+    if (!Platform::FileExists(directory + kPageFile)) {
+        Log::Error(std::string("Panel: 面板资源缺失，把 panel 目录放到 ") + directory);
+        return false;
+    }
+
+    if (!WebView::Init()) {
+        Log::Error("Panel: 网页视图初始化失败");
+        return false;
+    }
+
+    InstallBridge();
+    WebView::SetBounds(EnsureBounds());
+
+    if (!g_navigated) {
+        WebView::MapFolder(kVirtualHost, directory);
+        WebView::Navigate(std::string("https://") + kVirtualHost + "/" + kPageFile);
+        g_navigated = true;
+    }
+
+    if (!modId.empty()) g_activeModId = modId;
+    WebView::SetVisible(true);
+    // 网页视图的可见性跟着菜单状态走，不置起来会被下一帧的菜单过渡收掉
+    Hooks::SetMenuVisible(true);
+    return true;
+}
+
+void Hide() {
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        table->panelHide();
+        return;
+    }
+    Hooks::SetMenuVisible(false);
+    WebView::SetVisible(false);
+}
+
+void Toggle() {
+    if (IsVisible()) {
+        Hide();
+        return;
+    }
+    Show();
+}
+
+bool IsVisible() {
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) return table->panelIsVisible() != 0;
+    return WebView::IsVisible();
+}
+
+void SetHotkey(const Input::Hotkey& hotkey) {
+    g_hotkey = hotkey;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) {
+        table->panelSetHotkey(static_cast<int>(hotkey.key), static_cast<unsigned int>(hotkey.modifiers));
+    }
+}
+
+Input::Hotkey GetHotkey() {
+    return g_hotkey;
+}
+
+void Init() {
+    g_initialized = true;
+}
+
+bool IsInitialized() {
+    return g_initialized;
+}
+
+void NotifyGameInit() {
+    // 网页视图在游戏初始化时会自己收起来，导航状态留着复用
+}
+
+void Process() {
+    if (g_hotkey.key == Input::Key::None) return;
+    if (!Input::WasPressed(g_hotkey)) return;
+    Toggle();
+}
+
+void Shutdown() {
+    const XBaseRuntime* table = RuntimeTable();
+    if (table) return;
+
+    Hide();
+    UninstallBridge();
+    g_navigated = false;
+    g_initialized = false;
+}
+
+namespace Abi {
+
+int MountJson(const char* specJson) {
+    if (!specJson) return 0;
+    return Mount(SpecFromJson(Json::Value::Parse(specJson))) ? 1 : 0;
+}
+
+void UnmountName(const char* modId) {
+    if (modId) Unmount(std::string(modId));
+}
+
+int BindValueRaw(const char* controlId, double (*read)(void*), void (*write)(double, void*), void* userData) {
+    if (!controlId || !read || !write) return 0;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) return 0;
+    binding->read = [read, userData] { return read(userData); };
+    binding->write = [write, userData](double value) { write(value, userData); };
+    return 1;
+}
+
+int BindActionRaw(const char* controlId, void (*run)(void*), void* userData) {
+    if (!controlId || !run) return 0;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) return 0;
+    binding->run = [run, userData] { run(userData); };
+    return 1;
+}
+
+void NotifyChangedName(const char* controlId, double value) {
+    if (controlId) NotifyChanged(std::string(controlId), value);
+}
+
+int Available() {
+    return IsAvailable() ? 1 : 0;
+}
+
+void ShowName(const char* modId) {
+    Show(modId ? std::string(modId) : std::string());
+}
+
+void HideName() {
+    Hide();
+}
+
+int IsVisibleRaw() {
+    return IsVisible() ? 1 : 0;
+}
+
+void SetHotkeyRaw(int key, unsigned int modifiers) {
+    g_hotkey = Input::Hotkey{static_cast<Input::Key>(key), static_cast<Input::Modifiers>(modifiers)};
+}
+
+} // namespace Abi
+
+} // namespace XBase::Panel

@@ -1,6 +1,6 @@
 # XBase 示例骨架
 
-> 三份可以直接拷贝出来改的模组骨架，覆盖最小插件、菜单界面与网页面板三条路径。
+> 四份可以直接拷贝出来改的模组骨架，覆盖最小插件、菜单界面、自写网页与通用面板四条路径。
 
 ## 边界
 
@@ -11,8 +11,9 @@
 | `01-hello` | 生命周期注册、日志、游戏内提示 | `Host` `Log` `Platform` |
 | `02-menu` | 界面绘制、配置持久化、热键、每帧状态推送 | `Hooks` `UI` `Config` `Input` `Player` |
 | `03-webui` | 本地页面映射、原生方法注册、页面反向调用 | `WebView` `WebBridge` `Config` |
+| `04-panel` | 把界面挂进 XBase 通用面板，零前端代码 | `Panel` `Config` `Player` |
 
-三份都用**单文件 asi 形态**：asi 自带业务代码，不需要额外的 payload dll，同一个源文件在 SA / VC / III 三个版本上都能跑，版本差异由 Bootstrap 加载的共享运行时承担。
+四份都用**单文件 asi 形态**：asi 自带业务代码，不需要额外的 payload dll，同一个源文件在 SA / VC / III 三个版本上都能跑，版本差异由 Bootstrap 加载的共享运行时承担。
 
 本目录不覆盖：三段式 payload 形态、能力矩阵全量说明、XBase 公共 API 逐项文档。这些看在线文档 [xbase](https://blog.miomoe.cn/docs/xbase)。
 
@@ -72,6 +73,32 @@ extern "C" __declspec(dllexport) void XBasePayloadDetach();
 ```
 
 不导出基名时 Bootstrap 会按 asi 文件名推导，把 `MyModVC.asi` 推成 `MyModVC`，数据目录、载荷名、清单校验三处会一起错。
+
+## 挂进通用面板
+
+`04-panel` 走的是另一条路：**不写任何前端**。XBase 自带一个 React 面板（`XBase\Library\panel\`），模组只描述界面结构并绑上读写回调，多个模组会聚合到同一个面板的侧栏上。
+
+面板状态归共享运行时，所以 `Panel::` 的每个调用都会转发到 `XBase{ver}.dll`，各模组看到的是同一份注册表。
+
+| 步骤 | 调用 | 作用 |
+|---|---|---|
+| 描述界面 | `Panel::Mount(ModSpec)` | 一次提交模组、页面、分区、控件整棵树 |
+| 绑读写 | `Panel::BindValue(id, read, write)` | 开关读写 0 与 1，数值直接读写，下拉读写的是 `options` 下标 |
+| 绑动作 | `Panel::BindAction(id, run)` | 按钮点击时触发 |
+| 回推变更 | `Panel::NotifyChanged(id, value)` | 模组自己在游戏里改了状态，让界面跟上 |
+| 开合 | `Panel::Show(modId)` / `Hide()` / `SetHotkey()` | 面板自身的开合与热键 |
+
+先 `Mount` 再 `Bind*`：绑定到的控件必须已经在注册表里，顺序反了会返回假并写一条警告日志。
+
+```cpp
+// 值统一是 double，C 接口上因此不必传任何 STL 容器
+XBase::Panel::BindValue(
+    "panelsample.scale",
+    [] { return gScale; },
+    [](double value) { gScale = value; });
+```
+
+控件 `id` 全局唯一，约定按 `模组名.分区.项` 起名。`Control` 上的 `capability` 填 `FeatureCapability`，能力不支持时控件置灰而不是消失；`games` 限定版本；`visibleWhen` 让控件依赖同分区另一个控件，前置 `!` 取反。
 
 ## 模组清单 package.json
 

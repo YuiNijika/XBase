@@ -1,0 +1,15 @@
+{
+  "name": "PanelSample",
+  "version": "v0.1.0",
+  "author": "Your Name",
+  "description": "挂进 XBase 通用面板的模组骨架，演示界面描述与钩子绑定",
+  "homepage": "",
+  "engines": {
+    "xbase": ">=0.1.0"
+  },
+  "dependencies": {
+    "Ultimate ASI Loader": "latest",
+    "WebView2 Runtime": "latest"
+  },
+  "license": "MIT"
+}
