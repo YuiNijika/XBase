@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WebUi 示例</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 24px;
+            background: #1c1c1e;
+            color: #f2f2f7;
+            font-family: system-ui, "Microsoft YaHei", sans-serif;
+        }
+
+        h1 {
+            margin: 0 0 16px;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        pre {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 8px;
+            background: #2c2c2e;
+            font-size: 13px;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebUi 示例</h1>
+
+    <label>
+        <input type="checkbox" id="godMode">
+        无敌
+    </label>
+
+    <pre id="output">等待操作</pre>
+
+    <script>
+        const checkbox = document.getElementById('godMode');
+        const output = document.getElementById('output');
+
+        // window.xbase 由 XBase 在页面脚本之前注入，call 返回 Promise
+        checkbox.addEventListener('change', async () => {
+            try {
+                const result = await window.xbase.call('mod.setGodMode', {
+                    enabled: checkbox.checked
+                });
+                output.textContent = JSON.stringify(result, null, 2);
+            } catch (error) {
+                output.textContent = String(error);
+            }
+        });
+    </script>
+</body>
+</html>

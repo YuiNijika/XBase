@@ -210,6 +210,8 @@ if /i "%CONFIG%"=="Release" (
 
     call :stage_sdk "..\XMenu"
     call :stage_sdk "..\III.VC.SA.WebView2"
+    rem example 是 XBase 自己的子目录，不是兄弟工程，路径不带上级
+    call :stage_sdk "example"
 )
 
 rem 查看器与 SDK 一起构建，产物落在 viewer\build\bin\XBase.exe

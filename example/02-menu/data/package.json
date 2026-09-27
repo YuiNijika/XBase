@@ -1,0 +1,14 @@
+{
+  "name": "Menu",
+  "version": "v0.1.0",
+  "author": "Your Name",
+  "description": "带界面的 XBase 模组骨架，演示菜单、配置与每帧状态推送",
+  "homepage": "",
+  "engines": {
+    "xbase": ">=0.1.0"
+  },
+  "dependencies": {
+    "Ultimate ASI Loader": "latest"
+  },
+  "license": "MIT"
+}

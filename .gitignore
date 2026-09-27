@@ -2,3 +2,5 @@ archives/
 build/
 tools/pack/
 archive/
+lib/Plugin*.lib
+example/lib/Plugin*.lib

@@ -1,0 +1,15 @@
+{
+  "name": "WebUi",
+  "version": "v0.1.0",
+  "author": "Your Name",
+  "description": "网页面板骨架，演示本地页面映射与原生方法注册",
+  "homepage": "",
+  "engines": {
+    "xbase": ">=0.1.0"
+  },
+  "dependencies": {
+    "Ultimate ASI Loader": "latest",
+    "WebView2 Runtime": "latest"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "Hello",
+  "version": "v0.1.0",
+  "author": "Your Name",
+  "description": "最小 XBase 模组骨架，演示生命周期注册与日志",
+  "homepage": "",
+  "engines": {
+    "xbase": ">=0.1.0"
+  },
+  "dependencies": {
+    "Ultimate ASI Loader": "latest"
+  },
+  "license": "MIT"
+}
