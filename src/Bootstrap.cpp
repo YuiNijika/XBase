@@ -1,4 +1,5 @@
 #include "Bootstrap.h"
+#include <XBase/Log.h>
 #include <XBase/Package.h>
 #include <XBase/Version.h>
 
@@ -305,15 +306,25 @@ bool Attach(ModuleHandle loaderModule) {
         return false;
     }
 
-    // mod 清单可以声明 engines.xbase 约束，不满足就拒绝挂载并弹出原因，
-    // 校验放在运行库加载之前，约束不满足就不必把共享库拉起来
+    // mod 清单的格式错误仍然阻止载入；版本约束不满足只告警，保持游戏与模组正常进入。
     std::string packageFailure;
-    if (!XBase::Package::Validate(hostName, packageFailure)) {
+    std::string packageWarning;
+    if (!XBase::Package::Validate(hostName, packageFailure, &packageWarning)) {
         ShowError(hostName, packageFailure.c_str());
         return false;
     }
 
     if (!EnsureRuntime(module, game, hostName)) return false;
+
+    if (!packageWarning.empty()) {
+        // Bootstrap 自己所在的静态库能写入当前 MOD 的 debug.log；
+        // 游戏内提示则交给共享运行时在下一个安全的逻辑帧发出。
+        XBase::Log::InitForMod(hostName.c_str());
+        XBase::Log::Warn(packageWarning);
+        if (runtimeTable->hostQueueMessage) {
+            runtimeTable->hostQueueMessage(packageWarning.c_str());
+        }
+    }
 
     // 入口就在本模块时不需要 payload，这是单文件 asi 形态
     if (GetProcAddress(module, "XBasePayloadAttach")) return true;

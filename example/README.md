@@ -114,7 +114,7 @@ XBase::Panel::BindValue(
 | `description` | 说明 |
 | `license` | SPDX 标识，例如 `MIT` |
 | `homepage` | 主页 |
-| `engines.xbase` | 所需 XBase 版本区间，不满足直接拒绝挂载 |
+| `engines.xbase` | 所需 XBase 版本区间；不满足时写入 MOD `debug.log` 并在游戏内提示，但不阻止启动 |
 | `dependencies` | 依赖声明，值是版本区间或发布通道标记 |
 
 依赖分两类：名字能对应到其它模组的，按对方清单里的版本校验；对应不到的是第三方运行库（加载器、WebView2 运行时这类），只声明不做自动校验。
@@ -172,7 +172,7 @@ void OnProcess() {
 | 游戏里完全没反应 | asi 是否放进 `plugins`，四个导出是否都带 `dllexport` |
 | 弹 Failed to detect | 游戏版本不支持，或 asi 放错了目录 |
 | 数据目录名带版本后缀 | 没导出 `XBasePayloadBaseName`，被按文件名推导了 |
-| 启动弹版本不满足 | `package.json` 的 `engines.xbase` 高于当前 XBase 版本 |
+| 启动提示版本不满足 | `package.json` 的 `engines.xbase` 或依赖版本不满足；模组继续加载，详情见对应 `debug.log` |
 | 清单改了没生效 | 清单要落到数据目录，只改源码里的 `data/package.json` 不重新构建不会更新 |
 | 菜单点开关没反应 | 状态没每帧推送，被下一帧覆盖了 |
 | 网页面板空白 | 页面没映射成虚拟 https 主机，或 `ui` 目录没拷进数据目录 |

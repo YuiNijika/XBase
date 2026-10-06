@@ -10,7 +10,7 @@
 
 namespace XBase::Panel {
 
-// 通用网页面板：XBase 提供壳与前端，模组只描述界面并挂钩子。
+// XBase 提供壳与前端，模组只描述界面并挂钩子。
 // 面板状态归共享运行时所有，多个模组挂进同一个面板，谁都不用写前端。
 enum class ControlKind {
     Toggle,

@@ -133,7 +133,7 @@ Bootstrap 在挂载模组**之前**读清单做约束校验，不满足就拒绝
 | --- | --- |
 | `name` | 显示名 |
 | `version` / `author` / `description` / `license` / `homepage` | 元信息 |
-| `engines.xbase` | 所需 XBase 版本区间 |
+| `engines.xbase` | 所需 XBase 版本区间；低于要求时记录警告但继续启动 |
 | `dependencies` | 依赖声明，能对应到其它模组的按版本校验，对应不到的是第三方运行库，只声明不校验 |
 
 清单不存在时按无约束放行，不报错，但同时也失去了保护。
@@ -291,7 +291,7 @@ cd panel && npm install && npm run build
 | 弹共享运行时加载失败 | `XBase\Library\XBase{ver}.dll` 缺失，重装 XBase |
 | 弹 ABI 版本不符 | 模组与本库不同源，重新一起构建 |
 | 数据目录名带版本后缀 | 没导出 `XBasePayloadBaseName`，被按文件名推导了 |
-| 启动弹版本不满足 | `package.json` 的 `engines.xbase` 高于当前版本 |
+| 启动提示版本不满足 | `package.json` 的 `engines.xbase` 或依赖版本不满足时，模组仍会加载，详情写入对应 `debug.log` 并显示游戏提示 |
 | 只链入口库的宿主 LNK2019 | `Bootstrap.cpp` 引了新 controller，补 premake 的 `ENTRY_SUPPORT_SOURCES` |
 | 面板打不开 | `XBase\Library\panel\index.html` 是否存在，机器上有没有 WebView2 运行时 |
 

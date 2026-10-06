@@ -392,7 +392,13 @@ bool Satisfies(const std::string& requirement, std::uint32_t runtimeNumber) {
     return false;
 }
 
-bool Validate(const std::string& modName, std::string& failureReason) {
+bool Validate(
+    const std::string& modName,
+    std::string& failureReason,
+    std::string* warningReason) {
+    failureReason.clear();
+    if (warningReason) warningReason->clear();
+
     Info info;
     const bool exists = Load(modName, info);
     if (!exists) {
@@ -429,9 +435,11 @@ bool Validate(const std::string& modName, std::string& failureReason) {
     if (problems.empty()) {
         return true;
     }
-    failureReason = "The XBase version or dependencies do not satisfy the mod requirement.\n\n"
-                    "Mod: " + info.name + "\nInstalled XBase: " + kVersionString + "\n\n" + problems;
-    return false;
+    if (warningReason) {
+        *warningReason = "XBase warning: package requirements are not satisfied; the mod will continue to load.\n\n"
+            "Mod: " + info.name + "\nInstalled XBase: " + kVersionString + "\n\n" + problems;
+    }
+    return true;
 }
 
 } // namespace XBase::Package
