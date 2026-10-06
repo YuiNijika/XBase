@@ -53,7 +53,7 @@ Build.bat Release --no-pause
 | `XBaseRuntimeEntry.lib` | `XBase.asi` 入口，只引导共享运行时 |
 | `XBaseModEntry.lib` | 单文件 asi 入口，引导后直接跑本模块业务 |
 | `XBaseSA.lib` / `XBaseVC.lib` / `XBaseIII.lib` | 按版本的静态后端 |
-| `XBaseSA.dll` / `XBaseVC.dll` / `XBaseIII.dll` | 共享运行时，仅 Release 构建 |
+| `XBase/Library/XBaseSA.dll` / `XBaseVC.dll` / `XBaseIII.dll` | 共享运行时，仅 Release 构建 |
 
 共享运行时只出 Release：plugin-sdk 的 `output/lib` 只有 Release 库，Debug 链接会因运行库与迭代器调试级别不匹配失败。
 
@@ -66,6 +66,7 @@ Release 构建成功后会自动 stage：
 example/include/XBase/*.h         示例骨架共用同一份 SDK
 example/lib/*.lib
 build/bin/Release/XBase/Library/panel/   通用面板前端
+build/bin/Release/XBase/Library/*.dll    共享运行时
 ```
 
 同步只在全部 Release 目标通过产物核验后执行，不会用旧库顶替缺失库。
@@ -150,16 +151,16 @@ XBase 用 `/MT`，跨模块传 `std::string` / `std::function` / `std::vector` �
 
 ## 通用面板
 
-XBase 自带一个 React 面板（`XBase\Library\panel\`），模组只描述界面并挂钩子，不写前端。多个模组聚合到同一个侧栏上。
+XBase 自带一个 React 面板（`XBase\Library\panel\`），模组只描述界面并挂钩子，不写前端。多个模组聚合到同一个侧栏上；每个 ASI 只有一个 Sidebar 项，`pages` 是该项内部的 Tab。
 
 ```cpp
 XBase::Panel::Mount(spec);                       // 模组 / 页面 / 分区 / 控件
 XBase::Panel::BindValue("mymod.godMode", read, write);
 XBase::Panel::BindAction("mymod.reset", run);
-XBase::Panel::SetHotkey(XBase::Input::Hotkey{XBase::Input::Key::F7, 0});
+XBase::Panel::SetHotkey(XBase::Input::Hotkey{XBase::Input::Key::P, 0});
 ```
 
-值统一用 `double`：开关读写 0 与 1，下拉读写的是 `options` 下标。面板状态归共享运行时，所以各模组看到的是同一份注册表。
+值统一用 `double`：开关读写 0 与 1，下拉读写的是 `options` 下标。面板状态归共享运行时，所以各模组看到的是同一份注册表。Panel 热键由 XBase 固定为 `P`。
 
 前端在 `XBase/panel/`，改完执行：
 

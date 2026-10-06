@@ -17,7 +17,7 @@ constexpr const char* kModName = "PanelSample";
 constexpr const char* kKeyGodMode = "godMode";
 constexpr const char* kKeyScale = "scale";
 constexpr const char* kKeyMode = "mode";
-constexpr XBase::Input::Key kPanelHotkey = XBase::Input::Key::F7;
+constexpr XBase::Input::Key kPanelHotkey = XBase::Input::Key::P;
 
 bool g_godMode = false;
 double g_scale = 1.0;
@@ -172,7 +172,7 @@ void OnGameInit() {
     }
 
     XBase::Panel::SetHotkey(XBase::Input::Hotkey{kPanelHotkey, 0});
-    XBase::Log::Info("面板已挂载，按 F7 开关");
+    XBase::Log::Info("面板已挂载，按 P 开关");
 }
 
 void OnProcess() {

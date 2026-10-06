@@ -4,7 +4,7 @@
 
 ## 边界
 
-这里只有**面板壳**，没有任何业务控件。界面内容全部由模组在运行时通过 `XBase::Panel::Mount` 挂进来。
+这里只有**面板壳**，没有任何业务控件。界面内容全部由模组在运行时通过 `XBase::Panel::Mount` 挂进来；一个 ASI 对应一个 Sidebar 项，`pages` 在项内作为 Tab 展示。
 
 | 层 | 位置 | 归谁 |
 |---|---|---|
@@ -22,7 +22,7 @@ npm install
 npm run build
 ```
 
-产物落到 `dist/index.html` 与 `dist/data/`，由 XBase 的 `Build.bat Release` stage 到 `build\bin\Release\XBase\Library\panel\`。
+产物落到 `dist/index.html` 与 `dist/data/`，由 XBase 的 `Build.bat Release` stage 到 `build\bin\Release\XBase\Library\panel\`，与共享运行时 DLL 一起归档在 `Library\` 下。
 
 产物是 file 协议与虚拟主机都能加载的经典脚本：Vite 插件剥掉 `type="module"` 与 `crossorigin`，输出 iife，资源路径全部相对。改构建配置时这两条不能丢，否则网页视图里页面是白的。
 

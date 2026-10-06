@@ -105,6 +105,36 @@ export default function App() {
     )
   }
 
+  if (schema.mods.length === 0) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center overflow-hidden bg-background p-8 text-foreground">
+        <div className="w-full max-w-xl text-center">
+          <div className="text-xs font-medium uppercase tracking-[0.28em] text-muted-foreground">XBase Panel</div>
+          <h1 className="mt-4 text-3xl font-semibold tracking-tight">等待模组挂载</h1>
+          <p className="mx-auto mt-3 max-w-md text-sm leading-6 text-muted-foreground">
+            当前没有可用的面板界面。挂载 XBase 模组后，这里会显示统一的控制面板。
+          </p>
+          <div className="mt-8 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              className="rounded-md border border-border bg-card px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+              onClick={() => window.location.reload()}
+            >
+              重新读取
+            </button>
+            <button
+              type="button"
+              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:opacity-90"
+              onClick={() => void callQuiet('panel.hide')}
+            >
+              关闭面板
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <Shell
       mods={schema.mods}

@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <windows.h>
 
 #if !defined(XBASE_RUNTIME_DLL)
 // 只有 mod 侧编得到 Bootstrap，共享运行时自己就是函数表的持有者
@@ -34,6 +35,7 @@ namespace {
 constexpr const char* kVirtualHost = "xbase.panel";
 constexpr const char* kPageFile = "index.html";
 constexpr const char* kPanelFolder = "Library\\panel\\";
+constexpr Input::Hotkey kPanelHotkey{Input::Key::P, 0};
 
 struct Binding {
     ValueRead read;
@@ -51,7 +53,7 @@ std::vector<ModEntry> g_mods;
 bool g_initialized = false;
 bool g_navigated = false;
 std::string g_activeModId;
-Input::Hotkey g_hotkey{Input::Key::F8, 0};
+Input::Hotkey g_hotkey = kPanelHotkey;
 Rect g_bounds{};
 bool g_boundsReady = false;
 
@@ -74,6 +76,48 @@ const XBaseRuntime* RuntimeTable() {
 
 std::string PanelDirectory() {
     return Platform::XBaseDirectory() + kPanelFolder;
+}
+
+std::string ModuleOwnerId() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&ModuleOwnerId), &module)) {
+        return {};
+    }
+
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD size = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (size == 0) return {};
+        if (size < path.size() - 1) {
+            path.resize(size);
+            break;
+        }
+        path.resize(path.size() * 2);
+    }
+
+    const std::size_t slash = path.find_last_of(L"\\/");
+    std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    const std::size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos) name.resize(dot);
+    for (const wchar_t* suffix : {L"III", L"SA", L"VC"}) {
+        const std::wstring token(suffix);
+        if (name.size() > token.size()
+            && name.compare(name.size() - token.size(), token.size(), token) == 0) {
+            name.resize(name.size() - token.size());
+            break;
+        }
+    }
+    if (name.empty()) return {};
+    const int utf8Size = WideCharToMultiByte(
+        CP_UTF8, 0, name.data(), static_cast<int>(name.size()), nullptr, 0, nullptr, nullptr);
+    if (utf8Size <= 0) return {};
+    std::string utf8(static_cast<std::size_t>(utf8Size), '\0');
+    WideCharToMultiByte(
+        CP_UTF8, 0, name.data(), static_cast<int>(name.size()), utf8.data(), utf8Size, nullptr, nullptr);
+    return utf8;
 }
 
 bool CapabilityOk(const std::optional<FeatureCapability>& capability) {
@@ -455,6 +499,7 @@ void ReleaseOwned(const std::string& modId) {
 Json::Value SpecJson(const ModSpec& spec) {
     Json::Value value;
     value.Set("modId", Json::Value(spec.modId));
+    value.Set("ownerId", Json::Value(spec.ownerId));
     value.Set("title", Json::Value(spec.title));
     value.Set("subtitle", Json::Value(spec.subtitle));
     value.Set("version", Json::Value(spec.version));
@@ -496,6 +541,7 @@ Json::Value SpecJson(const ModSpec& spec) {
 ModSpec SpecFromJson(const Json::Value& value) {
     ModSpec spec;
     spec.modId = value["modId"].AsString();
+    spec.ownerId = value["ownerId"].AsString();
     spec.title = value["title"].AsString();
     spec.subtitle = value["subtitle"].AsString();
     spec.version = value["version"].AsString();
@@ -529,26 +575,49 @@ ModSpec SpecFromJson(const Json::Value& value) {
 
 } // namespace
 
+// 控件必须先登记进 entry.bindings，BindValue/BindAction 与网页端的 get/set/run
+// 才能通过 FindBinding 命中；BindValue 只往已存在的槽位里填读写回调
+void PopulateBindings(ModEntry& entry) {
+    for (const Page& page : entry.spec.pages) {
+        for (const Section& section : page.sections) {
+            for (const Control& control : section.controls) {
+                entry.bindings[control.id] = Binding{};
+            }
+        }
+    }
+}
+
 bool Mount(const ModSpec& spec) {
-    if (spec.modId.empty()) {
+    ModSpec normalized = spec;
+    if (normalized.ownerId.empty()) normalized.ownerId = ModuleOwnerId();
+    if (normalized.modId.empty()) {
         Log::Warn("Panel: 挂载缺 modId，已忽略");
         return false;
     }
 
     const XBaseRuntime* table = RuntimeTable();
     if (table) {
-        return table->panelMount(SpecJson(spec).Serialize(false).c_str()) != 0;
+        return table->panelMount(SpecJson(normalized).Serialize(false).c_str()) != 0;
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
     for (ModEntry& entry : g_mods) {
-        if (entry.spec.modId == spec.modId) {
-            entry.spec = spec;
+        if (!normalized.ownerId.empty() && !entry.spec.ownerId.empty()
+            && entry.spec.ownerId == normalized.ownerId
+            && entry.spec.modId != normalized.modId) {
+            Log::Warn("Panel: 同一个 ASI 只能挂载一个 Sidebar，已拒绝重复挂载");
+            return false;
+        }
+        if (entry.spec.modId == normalized.modId) {
+            entry.spec = normalized;
             entry.bindings.clear();
+            PopulateBindings(entry);
             return true;
         }
     }
-    g_mods.push_back(ModEntry{spec, {}});
+    ModEntry entry{normalized, {}};
+    PopulateBindings(entry);
+    g_mods.push_back(std::move(entry));
     return true;
 }
 
@@ -639,6 +708,11 @@ bool Show(const std::string& modId) {
         return false;
     }
 
+    if (!Hooks::IsInitialized() && !Hooks::Init()) {
+        Log::Error("Panel: XBase 渲染与输入钩子初始化失败");
+        return false;
+    }
+
     const std::string directory = PanelDirectory();
     if (!Platform::FileExists(directory + kPageFile)) {
         Log::Error(std::string("Panel: 面板资源缺失，把 panel 目录放到 ") + directory);
@@ -691,16 +765,18 @@ bool IsVisible() {
 }
 
 void SetHotkey(const Input::Hotkey& hotkey) {
-    g_hotkey = hotkey;
+    // Panel 的全局入口由 XBase 统一拥有，模组传入的旧 F7 等配置不能覆盖它。
+    (void)hotkey;
+    g_hotkey = kPanelHotkey;
 
     const XBaseRuntime* table = RuntimeTable();
     if (table) {
-        table->panelSetHotkey(static_cast<int>(hotkey.key), static_cast<unsigned int>(hotkey.modifiers));
+        table->panelSetHotkey(static_cast<int>(kPanelHotkey.key), static_cast<unsigned int>(kPanelHotkey.modifiers));
     }
 }
 
 Input::Hotkey GetHotkey() {
-    return g_hotkey;
+    return kPanelHotkey;
 }
 
 void Init() {
@@ -717,6 +793,8 @@ void NotifyGameInit() {
 
 void Process() {
     if (g_hotkey.key == Input::Key::None) return;
+    // 网页面板获得焦点后按键消息不一定经过游戏窗口，先用系统键态补齐输入边沿
+    Input::PollSystemKeys();
     if (!Input::WasPressed(g_hotkey)) return;
     Toggle();
 }
@@ -784,7 +862,10 @@ int IsVisibleRaw() {
 }
 
 void SetHotkeyRaw(int key, unsigned int modifiers) {
-    g_hotkey = Input::Hotkey{static_cast<Input::Key>(key), static_cast<Input::Modifiers>(modifiers)};
+    // ABI 兼容旧版模组，但不允许旧配置把共享 Panel 改回 F7。
+    (void)key;
+    (void)modifiers;
+    g_hotkey = kPanelHotkey;
 }
 
 } // namespace Abi

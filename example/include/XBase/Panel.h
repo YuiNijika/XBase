@@ -80,8 +80,10 @@ struct Page {
 };
 
 struct ModSpec {
-    // 与 XBasePayloadBaseName 保持一致，卸载时按它摘掉整棵子树
+    // 与 XBasePayloadBaseName 保持一致；同一个 ASI 只能拥有一个 Sidebar 项。
     std::string modId;
+    // 由 XBase 内部填充的宿主模块身份，模组通常无需设置。
+    std::string ownerId;
     std::string title;
     std::string subtitle;
     std::string version;
@@ -114,6 +116,7 @@ void Hide();
 void Toggle();
 bool IsVisible();
 
+// Panel 的全局热键由 XBase 固定为 P，传入值仅为旧版本兼容参数。
 void SetHotkey(const Input::Hotkey& hotkey);
 Input::Hotkey GetHotkey();
 

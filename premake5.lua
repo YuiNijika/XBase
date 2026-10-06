@@ -294,6 +294,8 @@ local function add_runtime_target(projectName, targetName, sdkName, gameName, ga
         targetname(targetName)
         targetextension ".dll"
         implibname(projectName)
+        targetdir "build/bin/%{cfg.buildcfg}/XBase/Library"
+        implibdir "build/bin/%{cfg.buildcfg}"
 
         -- 静态库不需要解析符号，动态库必须把 plugin-sdk 链进来，
         -- 也只有这里链一份，mod 侧就不再各自带一份 plugin-sdk 全局

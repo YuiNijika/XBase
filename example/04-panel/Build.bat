@@ -129,10 +129,36 @@ if exist "ui\" (
     echo [Info] Staged ui to build\bin\XBase\Mods\!PROJECT_NAME!\ui
 )
 
+rem 运行时与示例必须配套，避免游戏目录继续加载旧版共享库
+set "XBASE_RUNTIME_DIR=..\..\build\bin\Release\XBase\Library"
+if not exist "!XBASE_RUNTIME_DIR!\XBaseVC.dll" (
+    echo [Error] Missing rebuilt XBase runtime at !XBASE_RUNTIME_DIR!
+    echo [Error] Run ..\..\Build.bat Release first.
+    goto fail
+)
+if not exist "build\bin\XBase\Library\" mkdir "build\bin\XBase\Library"
+for %%G in (SA VC III) do (
+    xcopy "!XBASE_RUNTIME_DIR!\XBase%%G.dll" "build\bin\XBase\Library\" /Y /I >nul
+    if errorlevel 1 (
+        echo [Error] Failed to stage XBase%%G.dll
+        goto fail
+    )
+)
+if exist "!XBASE_RUNTIME_DIR!\panel\index.html" (
+    if not exist "build\bin\XBase\Library\panel" mkdir "build\bin\XBase\Library\panel"
+    xcopy "!XBASE_RUNTIME_DIR!\panel\*" "build\bin\XBase\Library\panel\" /E /I /Y >nul
+    if errorlevel 1 (
+        echo [Error] Failed to stage the XBase panel
+        goto fail
+    )
+)
+
 echo.
 echo Build completed successfully.
 echo Output files:
 for %%G in (SA VC III) do echo   build\bin\!PROJECT_NAME!%%G.asi
+echo   build\bin\XBase\Library\XBase{SA,VC,III}.dll
+echo   build\bin\XBase\Library\panel\index.html
 echo.
 echo Copy the asi matching your game into the game plugins folder.
 goto success

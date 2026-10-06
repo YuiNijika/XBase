@@ -76,7 +76,7 @@ extern "C" __declspec(dllexport) void XBasePayloadDetach();
 
 ## 挂进通用面板
 
-`04-panel` 走的是另一条路：**不写任何前端**。XBase 自带一个 React 面板（`XBase\Library\panel\`），模组只描述界面结构并绑上读写回调，多个模组会聚合到同一个面板的侧栏上。
+`04-panel` 走的是另一条路：**不写任何前端**。XBase 自带一个 React 面板（`XBase\Library\panel\`），模组只描述界面结构并绑上读写回调，多个模组会聚合到同一个面板的侧栏上；每个 ASI 只能拥有一个 Sidebar 项，`pages` 在该项内部显示为 Tab。
 
 面板状态归共享运行时，所以 `Panel::` 的每个调用都会转发到 `XBase{ver}.dll`，各模组看到的是同一份注册表。
 
@@ -89,6 +89,8 @@ extern "C" __declspec(dllexport) void XBasePayloadDetach();
 | 开合 | `Panel::Show(modId)` / `Hide()` / `SetHotkey()` | 面板自身的开合与热键 |
 
 先 `Mount` 再 `Bind*`：绑定到的控件必须已经在注册表里，顺序反了会返回假并写一条警告日志。
+
+面板热键由共享 XBase 运行时统一轮询，固定为 `P`；模组只需要注册 Host、挂载 Panel 并调用 `SetHotkey()`（传入值仅为旧版本兼容参数）。不要在模组侧重复调用 `Core::Init()`、`Core::Process()` 或 `Core::Shutdown()`。共享运行时会统一驱动 Panel 域和 WebView，多个模组聚合到同一个面板。完整接入方式见 `04-panel/src/main.cpp`。
 
 ```cpp
 // 值统一是 double，C 接口上因此不必传任何 STL 容器

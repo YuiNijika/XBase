@@ -270,6 +270,11 @@ bool EnsureRuntime(HMODULE module, DetectedGame game, const std::string& hostNam
     }
 
     runtimeTable = table;
+    if (!runtimeTable->acquire || runtimeTable->acquire(hostName.c_str()) == 0) {
+        runtimeTable = nullptr;
+        ShowError(hostName, "Failed to initialize the XBase shared runtime.");
+        return false;
+    }
     return true;
 }
 

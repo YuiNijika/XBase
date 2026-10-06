@@ -201,8 +201,8 @@ if /i "%CONFIG%"=="Release" (
     )
 
     for %%T in (XBaseSA XBaseVC XBaseIII) do (
-        if not exist "build\bin\%CONFIG%\%%T.dll" (
-            echo [Error] build\bin\%CONFIG%\%%T.dll was not produced.
+        if not exist "build\bin\%CONFIG%\XBase\Library\%%T.dll" (
+            echo [Error] build\bin\%CONFIG%\XBase\Library\%%T.dll was not produced.
             goto fail
         )
     )
@@ -222,7 +222,7 @@ echo.
 echo Build completed successfully.
 echo Outputs: XBaseBootstrap.lib, XBasePayloadEntry.lib, XBaseSA.lib, XBaseVC.lib, XBaseIII.lib
 echo           XBaseRuntimeEntry.lib, XBaseModEntry.lib
-echo           XBaseSA.dll, XBaseVC.dll, XBaseIII.dll
+echo           XBase\Library\XBaseSA.dll, XBaseVC.dll, XBaseIII.dll
 goto success
 
 rem ============================================================
