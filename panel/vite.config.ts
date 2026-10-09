@@ -26,6 +26,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, 'src'),
+      cn: path.resolve(import.meta.dirname, 'src/lib/cn.ts'),
     },
   },
   build: {

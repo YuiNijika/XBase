@@ -1,6 +1,35 @@
+export type ComponentNode = {
+  component: string
+  text?: string
+  textPath?: string
+  props?: Record<string, unknown> | null
+  children?: ComponentNode[] | null
+  slots?: Record<string, ComponentNode[]> | null
+  templates?: Record<string, ComponentNode> | null
+  bindings?: ComponentBinding[] | null
+}
+
+export type ComponentBinding = {
+  controlId: string
+  property: string
+  event: string
+  kind: 0 | 1 | 2 | 3
+}
+
+export function componentBindings(node?: ComponentNode): ComponentBinding[] {
+  if (!node) return []
+  return [
+    ...(node.bindings ?? []),
+    ...(node.children ?? []).flatMap(componentBindings),
+    ...Object.values(node.slots ?? {}).flatMap((nodes) => nodes.flatMap(componentBindings)),
+    ...Object.values(node.templates ?? {}).flatMap(componentBindings),
+  ]
+}
+
 export type PanelControl = {
   id: string
-  kind: 'toggle' | 'float' | 'int' | 'action' | 'select' | 'text' | 'textarea' | 'color' | 'progress' | 'custom' | 'radio' | 'multiselect' | 'heading' | 'separator'
+  kind: 'toggle' | 'float' | 'int' | 'action' | 'select' | 'text' | 'textarea' | 'color' | 'progress' | 'custom' | 'radio' | 'multiselect' | 'heading' | 'separator' | 'component'
+  component?: ComponentNode
   label: string
   hint: string
   // 能力不支持时为假，控件照画但置灰，玩家能看到这个功能确实存在

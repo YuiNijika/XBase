@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/cn'
 import { call, runAction, writeText, writeValue, type PanelControl, type PanelSection } from '@/lib/bridge'
+import { ComponentTree } from '@/components/component-tree'
+import { Switch } from '@/components/ui/switch'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
+import { Checkbox } from '@/components/ui/checkbox'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Progress } from '@/components/ui/progress'
+import { Slider } from '@/components/ui/slider'
+import { Separator } from '@/components/ui/separator'
 
 type SectionListProps = {
   sections: PanelSection[]
@@ -66,6 +77,8 @@ function Section({
               disabled={!section.enabled}
               value={values[control.id]}
               textValue={textValues[control.id]}
+              values={values}
+              textValues={textValues}
               onValue={onValue}
               onTextValue={onTextValue}
             />
@@ -80,6 +93,8 @@ function Section({
               disabled={!section.enabled}
               value={values[control.id]}
               textValue={textValues[control.id]}
+              values={values}
+              textValues={textValues}
               onValue={onValue}
               onTextValue={onTextValue}
             />
@@ -108,6 +123,8 @@ function ControlRow({
   disabled,
   value,
   textValue,
+  values,
+  textValues,
   onValue,
   onTextValue,
 }: {
@@ -115,9 +132,14 @@ function ControlRow({
   disabled: boolean
   value: number | undefined
   textValue: string | undefined
+  values: Record<string, number>
+  textValues: Record<string, string>
   onValue: (id: string, next: number) => void
   onTextValue: (id: string, next: string) => void
 }) {
+  if (control.kind === 'component' && control.component) {
+    return <ComponentTree node={control.component} disabled={disabled || !control.enabled || control.readOnly} values={values} textValues={textValues} onValue={onValue} onTextValue={onTextValue} />
+  }
   if (control.kind === 'toggle') {
     const checked = value !== undefined && value !== 0
     return (
@@ -139,7 +161,7 @@ function ControlRow({
     return (
       <label className="flex items-center justify-between gap-3 text-sm">
         <span className="min-w-0 truncate">{control.label}</span>
-        <select
+        <NativeSelect
           className="h-8 min-w-0 max-w-[60%] rounded-md border border-input bg-background px-2 text-sm text-foreground disabled:opacity-50"
           value={String(Math.round(value ?? 0))}
           disabled={disabled || !control.enabled}
@@ -150,11 +172,11 @@ function ControlRow({
           }}
         >
           {(control.options ?? []).map((option, index) => (
-            <option key={option.value} value={String(index)}>
+            <NativeSelectOption key={option.value} value={String(index)}>
               {option.label}
-            </option>
+            </NativeSelectOption>
           ))}
-        </select>
+        </NativeSelect>
       </label>
     )
   }
@@ -209,7 +231,7 @@ function ControlRow({
   }
 
   if (control.kind === 'separator') {
-    return <div className="h-px bg-border/60" aria-hidden="true" />
+    return <Separator />
   }
 
   if (control.kind === 'custom') {
@@ -217,7 +239,7 @@ function ControlRow({
   }
 
   return (
-    <button
+    <Button
       type="button"
       disabled={disabled || !control.enabled}
       onClick={() => void runAction(control.id)}
@@ -229,7 +251,7 @@ function ControlRow({
       )}
     >
       {control.label}
-    </button>
+    </Button>
   )
 }
 
@@ -268,7 +290,7 @@ function TextRow({
     return (
       <label className="grid gap-1 text-sm">
         <span className="font-medium">{control.label}</span>
-        <textarea
+        <Textarea
           className="min-h-24 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground disabled:opacity-50"
           value={text}
           placeholder={control.placeholder}
@@ -284,7 +306,7 @@ function TextRow({
   return (
     <label className="flex items-center gap-2 text-sm">
       <span className="min-w-0 flex-1 truncate">{control.label}</span>
-      <input
+      <Input
         className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground disabled:opacity-50"
         value={text}
         placeholder={control.placeholder}
@@ -346,23 +368,20 @@ function RadioRow({
   return (
     <fieldset className="grid gap-1.5 text-sm">
       <legend className="font-medium">{control.label}</legend>
-      <div className="flex flex-wrap gap-2">
+      <RadioGroup className="flex flex-wrap gap-2" value={String(selected)} disabled={disabled} onValueChange={(next) => {
+        onValue(control.id, Number(next))
+        void writeValue(control.id, Number(next))
+      }}>
         {(control.options ?? []).map((option, index) => (
           <label key={option.value} className={cn('flex items-center gap-1.5', disabled && 'opacity-50')}>
-            <input
-              type="radio"
-              name={control.id}
-              checked={selected === index}
+            <RadioGroupItem
+              value={String(index)}
               disabled={disabled}
-              onChange={() => {
-                onValue(control.id, index)
-                void writeValue(control.id, index)
-              }}
             />
             <span>{option.label}</span>
           </label>
         ))}
-      </div>
+      </RadioGroup>
     </fieldset>
   )
 }
@@ -388,11 +407,10 @@ function MultiSelectRow({
           const checked = (mask & bit) !== 0
           return (
             <label key={option.value} className={cn('flex items-center gap-1.5', disabled && 'opacity-50')}>
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={checked}
                 disabled={disabled}
-                onChange={() => {
+                onCheckedChange={() => {
                   const next = checked ? mask & ~bit : mask | bit
                   onValue(control.id, next)
                   void writeValue(control.id, next)
@@ -418,9 +436,7 @@ function ProgressRow({ control, value }: { control: PanelControl; value: number 
         <span className="min-w-0 truncate">{control.label}</span>
         <span className="shrink-0 tabular-nums text-muted-foreground">{formatValue(control, current)}</span>
       </div>
-      <div className="h-2 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuemin={min} aria-valuemax={max} aria-valuenow={current}>
-        <div className="h-full rounded-full bg-primary transition-[width] duration-150" style={{ width: `${ratio}%` }} />
-      </div>
+      <Progress value={ratio} aria-label={control.label} />
     </div>
   )
 }
@@ -503,19 +519,17 @@ function NumberRow({
           <span className="min-w-0 truncate">{control.label}</span>
           <span className="shrink-0 tabular-nums text-muted-foreground">{formatValue(control, current)}</span>
         </div>
-        <input
-          type="range"
+        <Slider
           className="mt-1.5 w-full cursor-pointer disabled:opacity-50"
           style={{ accentColor: 'oklch(0.72 0.14 var(--accent-hue))' }}
           min={control.min}
           max={control.max}
           step={step}
-          value={current}
+          value={[current]}
           disabled={disabled}
           aria-label={control.label}
-          onChange={(event) => onValue(control.id, Number(event.currentTarget.value))}
-          onPointerUp={() => void writeValue(control.id, current)}
-          onKeyUp={() => void writeValue(control.id, current)}
+          onValueChange={([next]) => onValue(control.id, next)}
+          onValueCommit={([next]) => void writeValue(control.id, next)}
         />
       </div>
     )
@@ -525,7 +539,7 @@ function NumberRow({
   return (
     <div className="flex items-center gap-2 text-sm">
       <span className="min-w-0 flex-1 truncate">{control.label}</span>
-      <input
+      <Input
         className="h-8 w-20 rounded-md border border-input bg-background px-2 text-sm text-foreground disabled:opacity-50"
         inputMode={control.kind === 'int' ? 'numeric' : 'decimal'}
         value={text}
@@ -533,7 +547,7 @@ function NumberRow({
         aria-label={control.label}
         onChange={(event) => setText(event.currentTarget.value)}
       />
-      <button
+      <Button
         type="button"
         disabled={disabled}
         onClick={() => {
@@ -548,42 +562,8 @@ function NumberRow({
         )}
       >
         应用
-      </button>
+      </Button>
     </div>
-  )
-}
-
-function Switch({
-  checked,
-  disabled,
-  onCheckedChange,
-}: {
-  checked: boolean
-  disabled: boolean
-  onCheckedChange: (next: boolean) => void
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onCheckedChange(!checked)}
-      className={cn(
-        'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border border-transparent',
-        'transition-colors duration-150 disabled:opacity-50',
-        'focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
-        checked ? 'bg-primary' : 'bg-input',
-      )}
-    >
-      <span
-        className={cn(
-          'pointer-events-none block size-4 rounded-full bg-background shadow-sm',
-          'transition-transform duration-150',
-          checked ? 'translate-x-[18px]' : 'translate-x-[2px]',
-        )}
-      />
-    </button>
   )
 }
 

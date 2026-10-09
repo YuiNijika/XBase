@@ -157,6 +157,7 @@ const char* KindName(ControlKind kind) {
     case ControlKind::MultiSelect: return "multiselect";
     case ControlKind::Heading: return "heading";
     case ControlKind::Separator: return "separator";
+    case ControlKind::Component: return "component";
     }
     return "toggle";
 }
@@ -175,6 +176,7 @@ ControlKind KindFromName(const std::string& name) {
     if (name == "multiselect") return ControlKind::MultiSelect;
     if (name == "heading") return ControlKind::Heading;
     if (name == "separator") return ControlKind::Separator;
+    if (name == "component") return ControlKind::Component;
     return ControlKind::Toggle;
 }
 
@@ -261,6 +263,74 @@ void ResolveCustomAssets(ModSpec& spec) {
     }
 }
 
+Json::Value SerializeNode(const ComponentNode& node) {
+    Json::Value value;
+    value.Set("component", Json::Value(node.component));
+    value.Set("text", Json::Value(node.text));
+    value.Set("textPath", Json::Value(node.textPath));
+    value.Set("props", node.props);
+    Json::Value children;
+    for (const ComponentNode& child : node.children) {
+        children.Push(SerializeNode(child));
+    }
+    value.Set("children", children);
+    Json::Value slots;
+    for (const auto& [name, nodes] : node.slots) {
+        Json::Value items;
+        for (const ComponentNode& child : nodes) items.Push(SerializeNode(child));
+        slots.Set(name, items);
+    }
+    value.Set("slots", slots);
+    Json::Value templates;
+    for (const auto& [name, child] : node.templates) {
+        templates.Set(name, SerializeNode(child));
+    }
+    value.Set("templates", templates);
+    Json::Value bindings;
+    for (const ComponentBinding& binding : node.bindings) {
+        Json::Value item;
+        item.Set("controlId", Json::Value(binding.controlId));
+        item.Set("property", Json::Value(binding.property));
+        item.Set("event", Json::Value(binding.event));
+        item.Set("kind", Json::Value(static_cast<int>(binding.kind)));
+        bindings.Push(item);
+    }
+    value.Set("bindings", bindings);
+    return value;
+}
+
+ComponentNode ParseNode(const Json::Value& value) {
+    ComponentNode node;
+    node.component = value["component"].AsString();
+    node.text = value["text"].AsString();
+    node.textPath = value["textPath"].AsString();
+    node.props = value["props"];
+    const Json::Value& children = value["children"];
+    for (std::size_t i = 0; i < children.Size(); ++i) {
+        node.children.push_back(ParseNode(children[i]));
+    }
+    const Json::Value& slots = value["slots"];
+    for (const std::string& name : slots.Keys()) {
+        for (std::size_t i = 0; i < slots[name].Size(); ++i) {
+            node.slots[name].push_back(ParseNode(slots[name][i]));
+        }
+    }
+    const Json::Value& bindings = value["bindings"];
+    const Json::Value& templates = value["templates"];
+    for (const std::string& name : templates.Keys()) {
+        node.templates.emplace(name, ParseNode(templates[name]));
+    }
+    for (std::size_t i = 0; i < bindings.Size(); ++i) {
+        ComponentBinding binding;
+        binding.controlId = bindings[i]["controlId"].AsString();
+        binding.property = bindings[i]["property"].AsString();
+        binding.event = bindings[i]["event"].AsString();
+        binding.kind = static_cast<ComponentBindingKind>(bindings[i]["kind"].AsInt());
+        node.bindings.push_back(std::move(binding));
+    }
+    return node;
+}
+
 Json::Value SerializeControl(const Control& control) {
     Json::Value value;
     value.Set("id", Json::Value(control.id));
@@ -283,6 +353,7 @@ Json::Value SerializeControl(const Control& control) {
     value.Set("styleFile", Json::Value(control.styleFile));
     value.Set("readOnly", Json::Value(control.readOnly));
     value.Set("visibleWhen", Json::Value(control.visibleWhen));
+    value.Set("component", SerializeNode(control.component));
 
     if (!control.options.empty()) {
         Json::Value options;
@@ -319,6 +390,8 @@ Control ParseControl(const Json::Value& value) {
     control.styleFile = value["styleFile"].AsString();
     control.readOnly = value["readOnly"].AsBool(false);
     control.visibleWhen = value["visibleWhen"].AsString();
+    control.games = StringsFromJson(value["games"]);
+    control.component = ParseNode(value["component"]);
 
     const Json::Value& options = value["options"];
     if (options.IsArray()) {
@@ -765,14 +838,6 @@ ModSpec SpecFromJson(const Json::Value& value) {
         if (sections.IsArray()) {
             for (std::size_t j = 0; j < sections.Size(); ++j) {
                 Section section = ParseSection(sections[j]);
-                const Json::Value& controls = sections[j]["controls"];
-                if (controls.IsArray()) {
-                    for (std::size_t k = 0; k < controls.Size(); ++k) {
-                        Control control = ParseControl(controls[k]);
-                        control.games = StringsFromJson(controls[k]["games"]);
-                        section.controls.push_back(std::move(control));
-                    }
-                }
                 page.sections.push_back(std::move(section));
             }
         }
@@ -785,11 +850,23 @@ ModSpec SpecFromJson(const Json::Value& value) {
 
 // 控件必须先登记进 entry.bindings，BindValue/BindAction 与网页端的 get/set/run
 // 才能通过 FindBinding 命中；BindValue 只往已存在的槽位里填读写回调
+void PopulateNodeBindings(ModEntry& entry, const ComponentNode& node) {
+    for (const ComponentBinding& binding : node.bindings) {
+        if (!binding.controlId.empty()) entry.bindings.try_emplace(binding.controlId);
+    }
+    for (const ComponentNode& child : node.children) PopulateNodeBindings(entry, child);
+    for (const auto& [name, nodes] : node.slots) {
+        for (const ComponentNode& child : nodes) PopulateNodeBindings(entry, child);
+    }
+    for (const auto& [name, child] : node.templates) PopulateNodeBindings(entry, child);
+}
+
 void PopulateBindings(ModEntry& entry) {
     for (const Page& page : entry.spec.pages) {
         for (const Section& section : page.sections) {
             for (const Control& control : section.controls) {
                 entry.bindings[control.id] = Binding{};
+                PopulateNodeBindings(entry, control.component);
             }
         }
     }

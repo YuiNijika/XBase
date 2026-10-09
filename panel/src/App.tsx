@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 import { Shell } from '@/components/shell'
 import { SectionList } from '@/components/section'
-import { callQuiet, fetchSchema, isBridgeAvailable, on, readText, readValue, type PanelMod, type PanelSchema } from '@/lib/bridge'
+import { Toaster } from '@/components/ui/sonner'
+import { callQuiet, componentBindings, fetchSchema, isBridgeAvailable, on, readText, readValue, type PanelMod, type PanelSchema } from '@/lib/bridge'
 
 export default function App() {
   const [schema, setSchema] = useState<PanelSchema | null>(null)
@@ -47,18 +48,22 @@ export default function App() {
 
   const controlIds = useMemo(() => {
     if (!activePage) return [] as string[]
-    return activePage.sections
+    const controls = activePage.sections
       .flatMap((section) => section.controls)
+    return [...new Set([...controls
       .filter((control) => ['toggle', 'float', 'int', 'select', 'color', 'progress', 'radio', 'multiselect'].includes(control.kind))
-      .map((control) => control.id)
+      .map((control) => control.id),
+      ...controls.flatMap((control) => componentBindings(control.component)).filter((binding) => binding.kind === 0).map((binding) => binding.controlId)])]
   }, [activePage])
 
   const textControlIds = useMemo(() => {
     if (!activePage) return [] as string[]
-    return activePage.sections
+    const controls = activePage.sections
       .flatMap((section) => section.controls)
+    return [...new Set([...controls
       .filter((control) => control.kind === 'text' || control.kind === 'textarea')
-      .map((control) => control.id)
+      .map((control) => control.id),
+      ...controls.flatMap((control) => componentBindings(control.component)).filter((binding) => binding.kind === 1 || binding.kind === 3).map((binding) => binding.controlId)])]
   }, [activePage])
 
   // 初始值向宿主取一次，避免开关显示与真实状态相反
@@ -178,6 +183,7 @@ export default function App() {
       onSelectPage={setActivePageId}
       onClose={() => void callQuiet('panel.hide')}
     >
+      <Toaster />
       {activeMod && activePage ? (
         <SectionList
           sections={activePage.sections}
