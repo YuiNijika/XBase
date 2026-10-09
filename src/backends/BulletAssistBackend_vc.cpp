@@ -1,12 +1,11 @@
 #include "BulletAssistBackend.h"
-#include <cstdio>
 #include "PedBackend.h"
 #include "RuntimeGuard.h"
 #include "common.h"
 
 #include <XBase/Core.h>
-#include <XBase/Log.h>
 #include <XBase/Ped.h>
+#include <XBase/Hooks.h>
 #include "CCamera.h"
 #include "CColModel.h"
 #include "CColPoint.h"
@@ -64,13 +63,13 @@ bool s_ownsFireInstantHit = false;
 bool s_ownsFireInstantHitFromCar = false;
 bool s_ownsProcessLineOfSight = false;
 int s_fireDepth = 0;
-unsigned int s_roundRobin = 0;
 
 struct Candidate {
     CPed* ped = nullptr;
     CVehicle* vehicle = nullptr;
     CVector position{};
     float score = 0.0f;
+    int reference = -1;
 };
 
 std::vector<Candidate> s_candidates;
@@ -125,13 +124,52 @@ bool IsRelationEnabled(Relation relation) {
     return false;
 }
 
-bool IsHelicopter(CVehicle* vehicle) {
-    return vehicle && (CModelInfo::IsHeliModel(vehicle->m_nModelIndex)
-        || vehicle->m_nVehicleClass == VEHICLE_HELI);
+RpAtomic* FindSkinHierarchy(RpAtomic* atomic, void* data) {
+    auto** hierarchy = static_cast<RpHAnimHierarchy**>(data);
+    *hierarchy = RpSkinAtomicGetHAnimHierarchy(atomic);
+    return *hierarchy ? nullptr : atomic;
+}
+
+RpHAnimHierarchy* PedHierarchy(CPed* ped) {
+    if (!ped || !ped->m_pRwClump) return nullptr;
+    RpHAnimHierarchy* hierarchy = nullptr;
+    RpClumpForAllAtomics(ped->m_pRwClump, FindSkinHierarchy, &hierarchy);
+    return hierarchy;
+}
+
+bool BonePosition(CPed* ped, RpHAnimHierarchy* hierarchy, int tag, CVector& position) {
+    if (!hierarchy || hierarchy->numNodes <= 0 || hierarchy->numNodes > 128) return false;
+    const int index = RpHAnimIDGetIndex(hierarchy, tag);
+    if (index < 0 || index >= hierarchy->numNodes) return false;
+    const RwMatrix* matrices = RpHAnimHierarchyGetMatrixArray(hierarchy);
+    if (!matrices) return false;
+    const RwV3d& point = matrices[index].pos;
+    position = {point.x, point.y, point.z};
+    if (hierarchy->flags & rpHANIMHIERARCHYLOCALSPACEMATRICES) {
+        position = ped->TransformFromObjectSpace(position);
+    }
+    return std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z)
+        && (position - ped->GetPosition()).MagnitudeSqr() < 64.0f;
 }
 
 CVector PedAimPosition(CPed* ped) {
     CVector position = ped->GetPosition();
+    RpHAnimHierarchy* hierarchy = PedHierarchy(ped);
+    constexpr int headTag = 8;
+    constexpr int chestTag = 3;
+    constexpr int pelvisTag = 2;
+    constexpr int leftKneeTag = 42;
+    constexpr int rightKneeTag = 52;
+    CVector bone{};
+    if (s_config.aimPart == BulletAssist::AimPart::Legs) {
+        CVector other{};
+        if (BonePosition(ped, hierarchy, leftKneeTag, bone)
+            && BonePosition(ped, hierarchy, rightKneeTag, other)) return (bone + other) * 0.5f;
+    } else {
+        const int tag = s_config.aimPart == BulletAssist::AimPart::Head ? headTag
+            : s_config.aimPart == BulletAssist::AimPart::Abdomen ? pelvisTag : chestTag;
+        if (BonePosition(ped, hierarchy, tag, bone)) return bone;
+    }
     switch (s_config.aimPart) {
     case BulletAssist::AimPart::Head: position.z += 0.82f; break;
     case BulletAssist::AimPart::Abdomen: position.z += 0.42f; break;
@@ -164,7 +202,7 @@ float Score(const CVector& cameraOrigin, const CVector& cameraDirection,
             const CVector& playerPosition, const CVector& target) {
     CVector delta = target - cameraOrigin;
     const float cameraDistance = delta.Magnitude();
-    if (cameraDistance < 0.05f) return -1.0f;
+    if (cameraDistance < 0.05f || !std::isfinite(cameraDistance)) return -1.0f;
     delta *= 1.0f / cameraDistance;
     const float affinity = delta.x * cameraDirection.x
         + delta.y * cameraDirection.y + delta.z * cameraDirection.z;
@@ -187,45 +225,80 @@ void CollectCandidates() {
         for (int index = 0; index < CPools::ms_pPedPool->m_nSize; ++index) {
             CPed* ped = CPools::ms_pPedPool->GetAt(index);
             if (!IsValidPed(ped, player) || !IsRelationEnabled(Classify(ped, player))) continue;
-            if (ped->m_bInVehicle && ped->m_pVehicle && IsHelicopter(ped->m_pVehicle)) continue;
+            if (!ped->m_pRwClump || ped->m_bInVehicle
+                || (ped->GetPosition() - playerPosition).MagnitudeSqr() > s_config.lockRange * s_config.lockRange) continue;
             const CVector target = PedAimPosition(ped);
             const float score = Score(cameraOrigin, cameraDirection, playerPosition, target);
-            if (score >= 0.0f) s_candidates.push_back({ped, nullptr, target, score});
+            if (score >= 0.0f) s_candidates.push_back({ped, nullptr, target, score, CPools::GetPedRef(ped)});
         }
     }
     if (CPools::ms_pVehiclePool) {
         for (int index = 0; index < CPools::ms_pVehiclePool->m_nSize; ++index) {
             CVehicle* vehicle = CPools::ms_pVehiclePool->GetAt(index);
-            if (!vehicle || vehicle->m_fHealth <= 0.0f || !IsHelicopter(vehicle)
+            if (!vehicle || !vehicle->m_pRwObject || vehicle->m_fHealth <= 0.0f
                 || vehicle == player->m_pVehicle) continue;
             const Relation relation = vehicle->m_pDriver && vehicle->m_pDriver != player
                 ? Classify(vehicle->m_pDriver, player) : Relation::Neutral;
             if (!IsRelationEnabled(relation)) continue;
             const CVector target = VehicleAimPosition(vehicle);
             const float score = Score(cameraOrigin, cameraDirection, playerPosition, target);
-            if (score >= 0.0f) s_candidates.push_back({nullptr, vehicle, target, score});
+            if (score >= 0.0f) s_candidates.push_back({nullptr, vehicle, target, score, CPools::GetVehicleRef(vehicle)});
         }
     }
 
-    std::sort(s_candidates.begin(), s_candidates.end(), [](const Candidate& left, const Candidate& right) {
+    const std::size_t count = std::min(s_candidates.size(), static_cast<std::size_t>(s_config.maxTargets));
+    std::partial_sort(s_candidates.begin(), s_candidates.begin() + count, s_candidates.end(), [](const Candidate& left, const Candidate& right) {
         return left.score > right.score;
     });
-    if (static_cast<int>(s_candidates.size()) > s_config.maxTargets) {
-        s_candidates.resize(static_cast<std::size_t>(s_config.maxTargets));
+    s_candidates.resize(count);
+}
+
+bool RefreshCandidate(Candidate& candidate) {
+    CPlayerPed* player = FindPlayerPed();
+    if (!player || candidate.reference < 0) return false;
+    if (candidate.ped) {
+        if (CPools::GetPed(candidate.reference) != candidate.ped || !IsValidPed(candidate.ped, player)) return false;
+        candidate.position = PedAimPosition(candidate.ped);
+    } else {
+        if (CPools::GetVehicle(candidate.reference) != candidate.vehicle
+            || !candidate.vehicle || candidate.vehicle->m_fHealth <= 0.0f
+            || candidate.vehicle == player->m_pVehicle) return false;
+        candidate.position = VehicleAimPosition(candidate.vehicle);
     }
+    return (candidate.position - player->GetPosition()).MagnitudeSqr() <= s_config.lockRange * s_config.lockRange;
+}
+
+bool ShotCanReach(const CVector& origin, const Candidate& candidate) {
+    if (s_config.throughWalls) return true;
+    if (!s_originalProcessLineOfSight) return false;
+    CColPoint point{};
+    CEntity* entity = nullptr;
+    const bool hit = s_originalProcessLineOfSight(origin, candidate.position, point, entity,
+        true, true, true, true, true, false, false, false);
+    return !hit || entity == candidate.ped || entity == candidate.vehicle;
 }
 
 void BeginShot() {
     ++s_fireDepth;
     if (s_fireDepth != 1) return;
     s_hasShotTarget = false;
-    if (!s_config.tracking || !RuntimeGuard::IsRuntimeSafe()) return;
-    CollectCandidates();
-    if (s_candidates.empty()) return;
-    const std::size_t index = s_candidates.size() == 1
-        ? 0u : static_cast<std::size_t>(s_roundRobin++ % s_candidates.size());
-    s_shotTarget = s_candidates[index].position;
-    s_hasShotTarget = true;
+    if (!s_config.tracking || !RuntimeGuard::IsRuntimeSafe()
+        || Hooks::IsMenuVisible() || Hooks::IsKeyboardCaptureActive()) return;
+    CVector origin{};
+    CVector direction{};
+    if (!CameraDirection(origin, direction)) return;
+    const auto choose = [&origin](Candidate& candidate) {
+        if (!RefreshCandidate(candidate) || !ShotCanReach(origin, candidate)) return false;
+        s_shotTarget = candidate.position;
+        s_hasShotTarget = true;
+        return true;
+    };
+    for (Candidate& candidate : s_candidates) {
+        if (candidate.ped == s_hardLockPed && candidate.ped && choose(candidate)) return;
+    }
+    for (Candidate& candidate : s_candidates) {
+        if (choose(candidate)) return;
+    }
 }
 
 void EndShot() {
@@ -268,6 +341,7 @@ bool __cdecl HookProcessLineOfSight(
     const CVector redirected = tracked ? ExtendPast(origin, s_shotTarget) : target;
     if (tracked) {
         peds = true;
+        vehicles = true;
     }
     if (s_config.throughWalls) {
         buildings = false;
@@ -339,11 +413,13 @@ void RemoveHook(std::uintptr_t address, bool& owned) {
 }
 
 bool WorldToScreen(const CVector& world, ImVec2& screen) {
+    if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z)) return false;
     RwV3d input{world.x, world.y, world.z};
     RwV3d output{};
     float width = 0.0f;
     float height = 0.0f;
     if (!CSprite::CalcScreenCoors(input, &output, &width, &height, true)) return false;
+    if (!std::isfinite(output.x) || !std::isfinite(output.y) || output.z <= 0.01f) return false;
     screen = {output.x, output.y};
     return true;
 }
@@ -457,6 +533,8 @@ bool PlayerWantsHardLockInput() {
 }
 
 void ApplyHardLock(const BulletAssist::Config& config) {
+    if (Hooks::IsMenuVisible() || Hooks::IsKeyboardCaptureActive()
+        || (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0) return;
     if (!config.hardLock || !config.tracking || !PlayerWantsHardLockInput()) {
         if (!config.hardLock || !config.tracking) ClearHardLock();
         return;
@@ -480,11 +558,8 @@ void DrawLine(ImDrawList* drawList, const CVector& from, const CVector& to, ImU3
     }
 }
 
-void DrawBounds(ImDrawList* drawList, CEntity* entity, ImU32 color) {
-    CColModel* collision = entity ? entity->GetColModel() : nullptr;
-    if (!collision) return;
-    const CVector& minimum = collision->m_boundBox.m_vecMin;
-    const CVector& maximum = collision->m_boundBox.m_vecMax;
+void DrawLocalBoxWire(ImDrawList* drawList, CEntity* entity, const CVector& minimum, const CVector& maximum, ImU32 color) {
+    if (!entity) return;
     CVector corners[8] = {
         {minimum.x, minimum.y, minimum.z}, {maximum.x, minimum.y, minimum.z},
         {maximum.x, maximum.y, minimum.z}, {minimum.x, maximum.y, minimum.z},
@@ -492,28 +567,21 @@ void DrawBounds(ImDrawList* drawList, CEntity* entity, ImU32 color) {
         {maximum.x, maximum.y, maximum.z}, {minimum.x, maximum.y, maximum.z},
     };
     for (CVector& corner : corners) corner = entity->TransformFromObjectSpace(corner);
+    ImVec2 projected[8]{};
+    bool valid[8]{};
+    for (int index = 0; index < 8; ++index) valid[index] = WorldToScreen(corners[index], projected[index]);
     constexpr int edges[12][2] = {
         {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}
     };
-    for (const auto& edge : edges) DrawLine(drawList, corners[edge[0]], corners[edge[1]], color);
+    for (const auto& edge : edges) {
+        if (valid[edge[0]] && valid[edge[1]]) drawList->AddLine(projected[edge[0]], projected[edge[1]], color, 1.2f);
+    }
 }
 
-void DrawLocalBoxWire(ImDrawList* drawList, CEntity* entity, const CVector& minimum, const CVector& maximum, ImU32 color) {
-    if (!entity) return;
-    CVector corners[8] = {
-        entity->TransformFromObjectSpace(CVector(minimum.x, minimum.y, minimum.z)),
-        entity->TransformFromObjectSpace(CVector(maximum.x, minimum.y, minimum.z)),
-        entity->TransformFromObjectSpace(CVector(maximum.x, maximum.y, minimum.z)),
-        entity->TransformFromObjectSpace(CVector(minimum.x, maximum.y, minimum.z)),
-        entity->TransformFromObjectSpace(CVector(minimum.x, minimum.y, maximum.z)),
-        entity->TransformFromObjectSpace(CVector(maximum.x, minimum.y, maximum.z)),
-        entity->TransformFromObjectSpace(CVector(maximum.x, maximum.y, maximum.z)),
-        entity->TransformFromObjectSpace(CVector(minimum.x, maximum.y, maximum.z)),
-    };
-    constexpr int edges[12][2] = {
-        {0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}
-    };
-    for (const auto& edge : edges) DrawLine(drawList, corners[edge[0]], corners[edge[1]], color);
+void DrawBounds(ImDrawList* drawList, CEntity* entity, ImU32 color) {
+    CColModel* collision = entity ? entity->GetColModel() : nullptr;
+    if (!collision) return;
+    DrawLocalBoxWire(drawList, entity, collision->m_boundBox.m_vecMin, collision->m_boundBox.m_vecMax, color);
 }
 
 void DrawLocalSphereWire(ImDrawList* drawList, CEntity* entity, const CVector& center, float radius, ImU32 color) {
@@ -558,71 +626,35 @@ void DrawCollision(ImDrawList* drawList, CEntity* entity, ImU32 boxColor, ImU32 
     }
 }
 
-// RW 3.4 的动画层级布局，plugin-sdk 未提供这份结构，字段与参考实现一致：
-// +0x4 节点数、+0x8 骨骼矩阵数组（每项 0x40，位置在 +0x30）、+0x10 节点信息（每项 0x10）。
-// 蒙皮 ped 的帧 LTM 不跟随动画，趴着的骨骼就是从帧 LTM 取出来的，必须改走层级矩阵
-struct VcHAnimHierarchy {
-    void* frame;
-    std::uint32_t numNodes;
-    void* matrixPalette;
-    std::uint32_t flags;
-    void* nodeInfo;
-};
-
 void DrawSkeleton(ImDrawList* drawList, CPed* ped, ImU32 color) {
-    if (!ped->m_pRwClump) return;
-    // clump 的原子链表，第一个节点按参考实现反解出层级；
-    // 0x7BA084 是 VC 的原子偏移量，这条链路在 1.0 上是验证过的
-    auto* firstNode = *reinterpret_cast<char**>(reinterpret_cast<char*>(ped->m_pRwClump) + 0x8);
-    if (!firstNode) return;
-    const int atomicOffset = *reinterpret_cast<const int*>(0x7BA084);
-    auto* hierarchy = *reinterpret_cast<VcHAnimHierarchy**>(firstNode + 0x40 - atomicOffset);
-
-    // 一次性诊断：链路每一环的实际值，断在哪一眼就能看出来
-    static bool diagnosed = false;
-    if (!diagnosed) {
-        diagnosed = true;
-        char dump[512] = {};
-        std::snprintf(dump, sizeof(dump),
-            "骨骼诊断: clump=%p firstNode=%p atomicOffset=%d hierarchy=%p",
-            reinterpret_cast<const void*>(ped->m_pRwClump),
-            reinterpret_cast<const void*>(firstNode), atomicOffset,
-            reinterpret_cast<const void*>(hierarchy));
-        Log::Warn(dump);
-        if (hierarchy) {
-            std::snprintf(dump, sizeof(dump),
-                "骨骼诊断: numNodes=%u matrixPalette=%p nodeInfo=%p",
-                hierarchy->numNodes,
-                reinterpret_cast<const void*>(hierarchy->matrixPalette),
-                reinterpret_cast<const void*>(hierarchy->nodeInfo));
-            Log::Warn(dump);
-            const RwMatrix* diagPalette = static_cast<const RwMatrix*>(hierarchy->matrixPalette);
-            const std::uint32_t* diagNodes = static_cast<const std::uint32_t*>(hierarchy->nodeInfo);
-            for (std::uint32_t index = 0; index < hierarchy->numNodes && index < 6; ++index) {
-                const RwV3d* position = RwMatrixGetPos(&diagPalette[index]);
-                std::snprintf(dump, sizeof(dump),
-                    "骨骼诊断: 节点 %u nodeID=%u parent=%u pos=(%.1f, %.1f, %.1f)",
-                    index, diagNodes[index * 4 + 0], diagNodes[index * 4 + 3],
-                    position ? position->x : 0.0f, position ? position->y : 0.0f, position ? position->z : 0.0f);
-                Log::Warn(dump);
-            }
+    RpHAnimHierarchy* hierarchy = PedHierarchy(ped);
+    if (!hierarchy) return;
+    // Resolve model bone tags through RenderWare instead of interpreting frame pointers as indices
+    constexpr int links[][2] = {
+        {2, 3}, {3, 4}, {4, 5}, {5, 8},
+        {4, 22}, {22, 23}, {23, 24}, {24, 25},
+        {4, 32}, {32, 33}, {33, 34}, {34, 35},
+        {2, 41}, {41, 42}, {42, 43}, {43, 44},
+        {2, 51}, {51, 52}, {52, 53}, {53, 54},
+    };
+    for (const auto& link : links) {
+        CVector from{};
+        CVector to{};
+        if (BonePosition(ped, hierarchy, link[0], from) && BonePosition(ped, hierarchy, link[1], to)) {
+            DrawLine(drawList, from, to, color);
         }
     }
+}
 
-    if (!hierarchy || !hierarchy->matrixPalette || !hierarchy->nodeInfo || hierarchy->numNodes == 0) return;
-
-    const RwMatrix* palette = static_cast<const RwMatrix*>(hierarchy->matrixPalette);
-    const std::uint32_t* nodes = static_cast<const std::uint32_t*>(hierarchy->nodeInfo);
-    for (std::uint32_t index = 1; index < hierarchy->numNodes; ++index) {
-        // 节点信息每项 0x10：nodeID / flags / frameIndex / parentIndex
-        const std::uint32_t parentIndex = nodes[index * 4 + 3];
-        if (parentIndex >= hierarchy->numNodes || parentIndex == index) continue;
-        const RwV3d* child = RwMatrixGetPos(&palette[index]);
-        const RwV3d* parent = RwMatrixGetPos(&palette[parentIndex]);
-        if (!child || !parent) continue;
-        if (child->x == 0.0f && child->y == 0.0f && child->z == 0.0f) continue;
-        DrawLine(drawList, {child->x, child->y, child->z}, {parent->x, parent->y, parent->z}, color);
-    }
+bool ShouldDraw(CEntity* entity, CPed* player, float range) {
+    if (!entity || !entity->m_pRwObject) return false;
+    if ((entity->GetPosition() - player->GetPosition()).MagnitudeSqr() > range * range) return false;
+    ImVec2 screen{};
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    constexpr float margin = 120.0f;
+    return WorldToScreen(entity->GetPosition(), screen)
+        && screen.x >= -margin && screen.y >= -margin
+        && screen.x <= size.x + margin && screen.y <= size.y + margin;
 }
 }
 
@@ -675,26 +707,26 @@ void Shutdown() {
 }
 
 void Draw(const BulletAssist::Config& config) {
-    if (!Core::IsWorldReady() || !RuntimeGuard::IsRuntimeSafe()) return;
+    if (!Core::IsWorldReady() || !RuntimeGuard::IsRuntimeSafe() || !ImGui::GetCurrentContext()) return;
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
     if (!drawList) return;
     CPlayerPed* player = FindPlayerPed();
     if (!player) return;
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    drawList->PushClipRect({0.0f, 0.0f}, size, true);
 
     if (config.tracking) {
-        const CVector playerPosition = player->GetPosition();
         for (const Candidate& candidate : s_candidates) {
             ImVec2 screen{};
             if (WorldToScreen(candidate.position, screen)) {
-                drawList->AddCircle(screen, 12.0f, IM_COL32(255, 40, 40, 255), 16, 2.0f);
+                drawList->AddCircle(screen, 8.0f, IM_COL32(255, 80, 80, 230), 16, 1.5f);
             }
-            DrawLine(drawList, playerPosition, candidate.position, IM_COL32(255, 40, 40, 220));
         }
     }
     if (CPools::ms_pPedPool && (config.drawPedBounds || config.drawPedCollision || config.drawPedSkeleton)) {
         for (int index = 0; index < CPools::ms_pPedPool->m_nSize; ++index) {
             CPed* ped = CPools::ms_pPedPool->GetAt(index);
-            if (!IsValidPed(ped, player)) continue;
+            if (!IsValidPed(ped, player) || !ShouldDraw(ped, player, config.lockRange)) continue;
             if (config.drawPedBounds) DrawBounds(drawList, ped, IM_COL32(80, 220, 120, 230));
             if (config.drawPedCollision) DrawCollision(drawList, ped, IM_COL32(60, 180, 255, 220), IM_COL32(120, 200, 255, 200));
             if (config.drawPedSkeleton) DrawSkeleton(drawList, ped, IM_COL32(255, 200, 60, 230));
@@ -703,11 +735,13 @@ void Draw(const BulletAssist::Config& config) {
     if (CPools::ms_pVehiclePool && (config.drawVehicleBounds || config.drawVehicleCollision)) {
         for (int index = 0; index < CPools::ms_pVehiclePool->m_nSize; ++index) {
             CVehicle* vehicle = CPools::ms_pVehiclePool->GetAt(index);
-            if (!vehicle || vehicle->m_fHealth <= 0.0f) continue;
+            if (!vehicle || vehicle == player->m_pVehicle || vehicle->m_fHealth <= 0.0f
+                || !ShouldDraw(vehicle, player, config.lockRange)) continue;
             if (config.drawVehicleBounds) DrawBounds(drawList, vehicle, IM_COL32(255, 140, 60, 230));
             if (config.drawVehicleCollision) DrawCollision(drawList, vehicle, IM_COL32(255, 90, 90, 220), IM_COL32(255, 160, 120, 200));
         }
     }
+    drawList->PopClipRect();
 }
 
 namespace {

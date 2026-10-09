@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,6 +41,8 @@ constexpr Input::Hotkey kPanelHotkey{Input::Key::P, 0};
 struct Binding {
     ValueRead read;
     ValueWrite write;
+    TextRead textRead;
+    TextWrite textWrite;
     ActionFn run;
 };
 
@@ -52,10 +55,13 @@ std::mutex g_mutex;
 std::vector<ModEntry> g_mods;
 bool g_initialized = false;
 bool g_navigated = false;
+WebView::WebViewId g_webViewId = WebView::DefaultInstance;
+bool g_systemHotkeyDown = false;
 std::string g_activeModId;
 Input::Hotkey g_hotkey = kPanelHotkey;
 Rect g_bounds{};
 bool g_boundsReady = false;
+Hooks::DrawCallbackId g_drawCallbackId{};
 
 // 共享运行时比 mod 的头文件旧时没有这一段，此时退回本地注册表，
 // 结果是每个模块各持一份面板，功能还在但不再聚合
@@ -77,6 +83,10 @@ const XBaseRuntime* RuntimeTable() {
 std::string PanelDirectory() {
     return Platform::XBaseDirectory() + kPanelFolder;
 }
+
+Rect EnsureBounds();
+void DrawCapturePanel();
+void HidePanelInput();
 
 std::string ModuleOwnerId() {
     HMODULE module = nullptr;
@@ -138,6 +148,15 @@ const char* KindName(ControlKind kind) {
     case ControlKind::Int: return "int";
     case ControlKind::Action: return "action";
     case ControlKind::Select: return "select";
+    case ControlKind::Text: return "text";
+    case ControlKind::Textarea: return "textarea";
+    case ControlKind::Color: return "color";
+    case ControlKind::Progress: return "progress";
+    case ControlKind::Custom: return "custom";
+    case ControlKind::Radio: return "radio";
+    case ControlKind::MultiSelect: return "multiselect";
+    case ControlKind::Heading: return "heading";
+    case ControlKind::Separator: return "separator";
     }
     return "toggle";
 }
@@ -147,6 +166,15 @@ ControlKind KindFromName(const std::string& name) {
     if (name == "int") return ControlKind::Int;
     if (name == "action") return ControlKind::Action;
     if (name == "select") return ControlKind::Select;
+    if (name == "text") return ControlKind::Text;
+    if (name == "textarea") return ControlKind::Textarea;
+    if (name == "color") return ControlKind::Color;
+    if (name == "progress") return ControlKind::Progress;
+    if (name == "custom") return ControlKind::Custom;
+    if (name == "radio") return ControlKind::Radio;
+    if (name == "multiselect") return ControlKind::MultiSelect;
+    if (name == "heading") return ControlKind::Heading;
+    if (name == "separator") return ControlKind::Separator;
     return ControlKind::Toggle;
 }
 
@@ -178,6 +206,61 @@ std::vector<std::string> StringsFromJson(const Json::Value& value) {
     return result;
 }
 
+bool IsSafeAssetPath(const std::string& value) {
+    if (value.empty() || value.find(':') != std::string::npos
+        || value.front() == '\\' || value.front() == '/') {
+        return false;
+    }
+
+    std::size_t start = 0;
+    while (start <= value.size()) {
+        const std::size_t end = value.find_first_of("\\/", start);
+        const std::string part = value.substr(
+            start,
+            end == std::string::npos ? std::string::npos : end - start);
+        if (part == "..") return false;
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return true;
+}
+
+bool LoadCustomAsset(
+    const std::string& modId,
+    const std::string& file,
+    const char* kind,
+    std::string& content) {
+    if (file.empty()) return false;
+    if (!IsSafeAssetPath(file)) {
+        Log::Warn(std::string("Panel: 拒绝不安全的 Custom ") + kind + " 文件路径: " + file);
+        return false;
+    }
+
+    std::string path = Platform::ModDirectory(modId.c_str()) + file;
+    std::replace(path.begin(), path.end(), '/', '\\');
+    std::string loaded;
+    if (!Platform::ReadTextFile(path, loaded)) {
+        Log::Warn(std::string("Panel: Custom ") + kind + " 文件读取失败: " + path);
+        return false;
+    }
+    content = std::move(loaded);
+    return true;
+}
+
+void ResolveCustomAssets(ModSpec& spec) {
+    for (Page& page : spec.pages) {
+        for (Section& section : page.sections) {
+            for (Control& control : section.controls) {
+                if (control.kind != ControlKind::Custom) continue;
+                // 文件字段优先；未配置文件时保留原有内联内容。
+                LoadCustomAsset(spec.modId, control.htmlFile, "HTML", control.html);
+                LoadCustomAsset(spec.modId, control.scriptFile, "JavaScript", control.script);
+                LoadCustomAsset(spec.modId, control.styleFile, "CSS", control.style);
+            }
+        }
+    }
+}
+
 Json::Value SerializeControl(const Control& control) {
     Json::Value value;
     value.Set("id", Json::Value(control.id));
@@ -190,6 +273,15 @@ Json::Value SerializeControl(const Control& control) {
     value.Set("max", Json::Value(control.max));
     value.Set("step", Json::Value(control.step));
     value.Set("format", Json::Value(control.format));
+    value.Set("text", Json::Value(control.text));
+    value.Set("placeholder", Json::Value(control.placeholder));
+    value.Set("html", Json::Value(control.html));
+    value.Set("script", Json::Value(control.script));
+    value.Set("style", Json::Value(control.style));
+    value.Set("htmlFile", Json::Value(control.htmlFile));
+    value.Set("scriptFile", Json::Value(control.scriptFile));
+    value.Set("styleFile", Json::Value(control.styleFile));
+    value.Set("readOnly", Json::Value(control.readOnly));
     value.Set("visibleWhen", Json::Value(control.visibleWhen));
 
     if (!control.options.empty()) {
@@ -217,6 +309,15 @@ Control ParseControl(const Json::Value& value) {
     control.max = value["max"].AsNumber(0.0);
     control.step = value["step"].AsNumber(0.0);
     control.format = value["format"].AsString();
+    control.text = value["text"].AsString();
+    control.placeholder = value["placeholder"].AsString();
+    control.html = value["html"].AsString();
+    control.script = value["script"].AsString();
+    control.style = value["style"].AsString();
+    control.htmlFile = value["htmlFile"].AsString();
+    control.scriptFile = value["scriptFile"].AsString();
+    control.styleFile = value["styleFile"].AsString();
+    control.readOnly = value["readOnly"].AsBool(false);
     control.visibleWhen = value["visibleWhen"].AsString();
 
     const Json::Value& options = value["options"];
@@ -299,7 +400,7 @@ Json::Value SchemaJson() {
     Json::Value result;
     result.Set("game", Json::Value(std::string(Runtime::GetGameKey())));
     result.Set("gameName", Json::Value(std::string(Runtime::GetGameName())));
-    result.Set("version", Json::Value(std::string(kVersionString)));
+    result.Set("version", Json::Value(std::string(GetVersionString())));
     result.Set("activeModId", Json::Value(g_activeModId));
 
     Json::Value mods;
@@ -364,6 +465,32 @@ Json::Value OnSet(const Json::Value& params) {
     return OkValue();
 }
 
+Json::Value OnGetText(const Json::Value& params) {
+    const std::string id = params["id"].AsString();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const Binding* binding = FindBinding(id);
+    if (!binding || !binding->textRead) {
+        return FailedValue("未绑定的文本控件: " + id);
+    }
+
+    Json::Value result;
+    result.Set("ok", Json::Value(true));
+    result.Set("value", Json::Value(binding->textRead()));
+    return result;
+}
+
+Json::Value OnSetText(const Json::Value& params) {
+    const std::string id = params["id"].AsString();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(id);
+    if (!binding || !binding->textWrite) {
+        return FailedValue("未绑定的文本控件: " + id);
+    }
+
+    binding->textWrite(params["value"].AsString());
+    return OkValue();
+}
+
 Json::Value OnRun(const Json::Value& params) {
     const std::string id = params["id"].AsString();
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -385,7 +512,19 @@ Rect EnsureBounds() {
         return g_bounds;
     }
 
-    const Vec2 display = UI::GetDisplaySize();
+    Vec2 display = UI::GetDisplaySize();
+    if (display.x <= 0.0f || display.y <= 0.0f) {
+        HWND gameWindow = GetForegroundWindow();
+        RECT client{};
+        if (gameWindow && GetClientRect(gameWindow, &client)) {
+            display = {
+                static_cast<float>(client.right - client.left),
+                static_cast<float>(client.bottom - client.top),
+            };
+        }
+    }
+    if (display.x <= 0.0f || display.y <= 0.0f) return {};
+
     const float width = display.x * 0.62f;
     const float height = display.y * 0.80f;
     g_bounds = Rect{(display.x - width) * 0.5f, (display.y - height) * 0.5f,
@@ -394,12 +533,62 @@ Rect EnsureBounds() {
     return g_bounds;
 }
 
+void DrawCapturePanel() {
+    if (g_webViewId == WebView::DefaultInstance
+        || !WebView::IsVisible(g_webViewId)
+        || !WebView::UsesCaptureMode(g_webViewId)) {
+        return;
+    }
+
+    const Rect bounds = EnsureBounds();
+    const float width = bounds.right - bounds.left;
+    const float height = bounds.bottom - bounds.top;
+    if (width <= 0.0f || height <= 0.0f) return;
+    WebView::SetBounds(g_webViewId, bounds);
+
+    UI::SetNextWindowPosition({bounds.left, bounds.top}, true);
+    UI::SetNextWindowSize({width, height}, true);
+    bool open = true;
+    UI::Window(
+        "XBasePanelWebView",
+        "XBase Panel",
+        [&] {
+            WebView::DrawPanel(g_webViewId, bounds);
+            const bool mouseDown = UI::IsMouseDown(UI::MouseButton::Left);
+            if (UI::IsLastItemHovered() || mouseDown) {
+                const float wheelDelta = Hooks::ConsumeWheelDelta();
+                WebView::ForwardPanelInput(
+                    g_webViewId,
+                    bounds,
+                    UI::GetMousePosition(),
+                    mouseDown,
+                    wheelDelta);
+            }
+        },
+        &open,
+        UI::Flag(UI::WindowFlag::NoTitleBar)
+            | UI::Flag(UI::WindowFlag::NoResize)
+            | UI::Flag(UI::WindowFlag::NoMove)
+            | UI::Flag(UI::WindowFlag::NoScrollbar)
+            | UI::Flag(UI::WindowFlag::NoBackground));
+    if (!open) {
+        HidePanelInput();
+    }
+}
+
+void HidePanelInput() {
+    Hooks::SetBackgroundInputActive(false);
+    Hooks::SetBackgroundRenderActive(false);
+    Hooks::SetMenuVisible(false);
+    WebView::SetVisible(g_webViewId, false);
+}
+
 Json::Value OnSetSize(const Json::Value& params) {
     const Rect current = EnsureBounds();
     const float width = static_cast<float>(params["width"].AsNumber(current.right - current.left));
     const float height = static_cast<float>(params["height"].AsNumber(current.bottom - current.top));
     g_bounds = Rect{current.left, current.top, current.left + width, current.top + height};
-    WebView::SetBounds(g_bounds);
+    WebView::SetBounds(g_webViewId, g_bounds);
     return OkValue();
 }
 
@@ -410,7 +599,7 @@ Json::Value OnSetPos(const Json::Value& params) {
     const float width = current.right - current.left;
     const float height = current.bottom - current.top;
     g_bounds = Rect{x, y, x + width, y + height};
-    WebView::SetBounds(g_bounds);
+    WebView::SetBounds(g_webViewId, g_bounds);
     return OkValue();
 }
 
@@ -425,10 +614,12 @@ Json::Value OnRect(const Json::Value&) {
 }
 
 void InstallBridge() {
-    WebBridge::Install();
+    WebBridge::Install(g_webViewId);
     WebBridge::RegisterMethod("panel.schema", OnSchema);
     WebBridge::RegisterMethod("panel.get", OnGet);
     WebBridge::RegisterMethod("panel.set", OnSet);
+    WebBridge::RegisterMethod("panel.getText", OnGetText);
+    WebBridge::RegisterMethod("panel.setText", OnSetText);
     WebBridge::RegisterMethod("panel.run", OnRun);
     WebBridge::RegisterMethod("panel.hide", OnHide);
     WebBridge::RegisterMethod("panel.setSize", OnSetSize);
@@ -440,6 +631,8 @@ void UninstallBridge() {
     WebBridge::UnregisterMethod("panel.schema");
     WebBridge::UnregisterMethod("panel.get");
     WebBridge::UnregisterMethod("panel.set");
+    WebBridge::UnregisterMethod("panel.getText");
+    WebBridge::UnregisterMethod("panel.setText");
     WebBridge::UnregisterMethod("panel.run");
     WebBridge::UnregisterMethod("panel.hide");
     WebBridge::UnregisterMethod("panel.setSize");
@@ -467,6 +660,21 @@ double TrampolineRead(void* userData) {
 void TrampolineWrite(double value, void* userData) {
     const auto* binding = static_cast<const Binding*>(userData);
     if (binding && binding->write) binding->write(value);
+}
+
+int TrampolineTextRead(char* buffer, std::uint32_t capacity, void* userData) {
+    const auto* binding = static_cast<const Binding*>(userData);
+    const std::string value = binding && binding->textRead ? binding->textRead() : std::string();
+    const std::size_t needed = value.size() + 1;
+    if (buffer && capacity >= needed) {
+        std::memcpy(buffer, value.c_str(), needed);
+    }
+    return static_cast<int>(needed);
+}
+
+void TrampolineTextWrite(const char* value, void* userData) {
+    const auto* binding = static_cast<const Binding*>(userData);
+    if (binding && binding->textWrite) binding->textWrite(value ? value : "");
 }
 
 void TrampolineRun(void* userData) {
@@ -594,6 +802,7 @@ bool Mount(const ModSpec& spec) {
         Log::Warn("Panel: 挂载缺 modId，已忽略");
         return false;
     }
+    ResolveCustomAssets(normalized);
 
     const XBaseRuntime* table = RuntimeTable();
     if (table) {
@@ -655,6 +864,29 @@ bool BindValue(const std::string& controlId, ValueRead read, ValueWrite write) {
     return true;
 }
 
+bool BindText(const std::string& controlId, TextRead read, TextWrite write) {
+    if (controlId.empty()) return false;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table && table->panelBindText) {
+        Binding* binding = OwnBinding(controlId);
+        binding->textRead = std::move(read);
+        binding->textWrite = std::move(write);
+        return table->panelBindText(
+            controlId.c_str(), &TrampolineTextRead, &TrampolineTextWrite, binding) != 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) {
+        Log::Warn(std::string("Panel: 文本控件未登记就绑定 ") + controlId);
+        return false;
+    }
+    binding->textRead = std::move(read);
+    binding->textWrite = std::move(write);
+    return true;
+}
+
 bool BindAction(const std::string& controlId, ActionFn run) {
     if (controlId.empty()) return false;
 
@@ -687,7 +919,22 @@ void NotifyChanged(const std::string& controlId, double value) {
     Json::Value payload;
     payload.Set("id", Json::Value(controlId));
     payload.Set("value", Json::Value(value));
-    WebBridge::Emit("panel.changed", payload);
+    WebBridge::Emit(g_webViewId, "panel.changed", payload);
+}
+
+void NotifyTextChanged(const std::string& controlId, const std::string& value) {
+    if (controlId.empty()) return;
+
+    const XBaseRuntime* table = RuntimeTable();
+    if (table && table->panelNotifyTextChanged) {
+        table->panelNotifyTextChanged(controlId.c_str(), value.c_str());
+        return;
+    }
+
+    Json::Value payload;
+    payload.Set("id", Json::Value(controlId));
+    payload.Set("value", Json::Value(value));
+    WebBridge::Emit(g_webViewId, "panel.textChanged", payload);
 }
 
 bool IsAvailable() {
@@ -699,6 +946,7 @@ bool IsAvailable() {
 bool Show(const std::string& modId) {
     const XBaseRuntime* table = RuntimeTable();
     if (table) {
+        Log::Info("Panel: 转发到共享运行时显示面板");
         table->panelShow(modId.c_str());
         return true;
     }
@@ -708,9 +956,14 @@ bool Show(const std::string& modId) {
         return false;
     }
 
+    if (g_webViewId == WebView::DefaultInstance) {
+        g_webViewId = WebView::Create();
+    }
+
     if (!Hooks::IsInitialized() && !Hooks::Init()) {
-        Log::Error("Panel: XBase 渲染与输入钩子初始化失败");
-        return false;
+        // XMenu 可能已经在另一个静态 XBase 副本里持有 D3D 钩子；
+        // 此时继续创建 WebView，窗口模式仍可直接显示，不能阻止 Panel 打开。
+        Log::Warn("Panel: 当前模块未持有渲染钩子，继续创建 WebView");
     }
 
     const std::string directory = PanelDirectory();
@@ -719,23 +972,22 @@ bool Show(const std::string& modId) {
         return false;
     }
 
-    if (!WebView::Init()) {
+    if (!WebView::Init(g_webViewId)) {
         Log::Error("Panel: 网页视图初始化失败");
         return false;
     }
 
     InstallBridge();
-    WebView::SetBounds(EnsureBounds());
+    WebView::SetBounds(g_webViewId, EnsureBounds());
 
     if (!g_navigated) {
-        WebView::MapFolder(kVirtualHost, directory);
-        WebView::Navigate(std::string("https://") + kVirtualHost + "/" + kPageFile);
+        WebView::MapFolder(g_webViewId, kVirtualHost, directory);
+        WebView::Navigate(g_webViewId, std::string("https://") + kVirtualHost + "/" + kPageFile);
         g_navigated = true;
     }
 
     if (!modId.empty()) g_activeModId = modId;
-    WebView::SetVisible(true);
-    // 网页视图的可见性跟着菜单状态走，不置起来会被下一帧的菜单过渡收掉
+    WebView::SetVisible(g_webViewId, true);
     Hooks::SetMenuVisible(true);
     return true;
 }
@@ -746,8 +998,7 @@ void Hide() {
         table->panelHide();
         return;
     }
-    Hooks::SetMenuVisible(false);
-    WebView::SetVisible(false);
+    HidePanelInput();
 }
 
 void Toggle() {
@@ -761,7 +1012,7 @@ void Toggle() {
 bool IsVisible() {
     const XBaseRuntime* table = RuntimeTable();
     if (table) return table->panelIsVisible() != 0;
-    return WebView::IsVisible();
+    return g_webViewId != WebView::DefaultInstance && WebView::IsVisible(g_webViewId);
 }
 
 void SetHotkey(const Input::Hotkey& hotkey) {
@@ -780,6 +1031,18 @@ Input::Hotkey GetHotkey() {
 }
 
 void Init() {
+    // 作为 mod 侧兼容层时，面板由 XBaseRuntime.dll 持有；
+    // 不创建一个永远不会使用的本地 WebView 实例。
+    if (RuntimeTable()) {
+        g_initialized = true;
+        return;
+    }
+    if (g_webViewId == WebView::DefaultInstance) {
+        g_webViewId = WebView::Create();
+    }
+    if (!g_drawCallbackId) {
+        g_drawCallbackId = Hooks::RegisterDrawCallback(DrawCapturePanel);
+    }
     g_initialized = true;
 }
 
@@ -792,10 +1055,22 @@ void NotifyGameInit() {
 }
 
 void Process() {
+    // 共享运行时拥有唯一的面板状态和全局 P 热键。
+    // 每个 ASI 仍会链接一份兼容版 Core，但不能再次处理同一个热键，
+    // 否则同一帧会对共享面板连续 Toggle，表现为按键完全没有效果。
+    if (RuntimeTable()) return;
     if (g_hotkey.key == Input::Key::None) return;
-    // 网页面板获得焦点后按键消息不一定经过游戏窗口，先用系统键态补齐输入边沿
-    Input::PollSystemKeys();
-    if (!Input::WasPressed(g_hotkey)) return;
+    if (g_webViewId != WebView::DefaultInstance && WebView::IsVisible(g_webViewId)) {
+        WebView::SetBounds(g_webViewId, EnsureBounds());
+    }
+    // XMenu 与共享 Runtime 各自有一份输入状态；网页获得焦点后，P 的
+    // AcceleratorKeyPressed 可能只抵达其中一份。Panel 固定使用 P，
+    // 直接读取系统键态，避免跨模块边沿丢失。
+    const bool down = (GetAsyncKeyState('P') & 0x8000) != 0;
+    const bool pressed = down && !g_systemHotkeyDown;
+    g_systemHotkeyDown = down;
+    if (!pressed) return;
+    Log::Info("Panel: 检测到 P 热键，切换面板");
     Toggle();
 }
 
@@ -804,8 +1079,18 @@ void Shutdown() {
     if (table) return;
 
     Hide();
+    if (g_drawCallbackId) {
+        Hooks::UnregisterDrawCallback(g_drawCallbackId);
+        g_drawCallbackId = {};
+    }
     UninstallBridge();
+    if (g_webViewId != WebView::DefaultInstance) {
+        WebBridge::Shutdown(g_webViewId);
+        WebView::Destroy(g_webViewId);
+        g_webViewId = WebView::DefaultInstance;
+    }
     g_navigated = false;
+    g_systemHotkeyDown = false;
     g_initialized = false;
 }
 
@@ -841,8 +1126,35 @@ int BindActionRaw(const char* controlId, void (*run)(void*), void* userData) {
     return 1;
 }
 
+int BindTextRaw(
+    const char* controlId,
+    int (*read)(char*, std::uint32_t, void*),
+    void (*write)(const char*, void*),
+    void* userData) {
+    if (!controlId || !read || !write) return 0;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Binding* binding = FindBinding(controlId);
+    if (!binding) return 0;
+    binding->textRead = [read, userData] {
+        const int needed = read(nullptr, 0, userData);
+        if (needed <= 1) return std::string();
+        std::string value(static_cast<std::size_t>(needed - 1), '\0');
+        read(value.data(), static_cast<std::uint32_t>(value.size() + 1), userData);
+        return value;
+    };
+    binding->textWrite = [write, userData](const std::string& value) {
+        write(value.c_str(), userData);
+    };
+    return 1;
+}
+
 void NotifyChangedName(const char* controlId, double value) {
     if (controlId) NotifyChanged(std::string(controlId), value);
+}
+
+void NotifyTextChangedName(const char* controlId, const char* value) {
+    if (controlId) NotifyTextChanged(std::string(controlId), value ? std::string(value) : std::string());
 }
 
 int Available() {

@@ -265,7 +265,7 @@ bool EnsureRuntime(HMODULE module, DetectedGame game, const std::string& hostNam
         const std::string message = std::string(
             "The XBase shared runtime was built for a different ABI version.\n\n"
             "This mod requires XBase ")
-            + XBase::kVersionString + " or newer. Rebuild the mod and XBase together.";
+            + std::string(XBase::GetVersionString()) + " or newer. Rebuild the mod and XBase together.";
         ShowError(hostName, message.c_str());
         return false;
     }

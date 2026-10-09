@@ -1,6 +1,6 @@
 export type PanelControl = {
   id: string
-  kind: 'toggle' | 'float' | 'int' | 'action' | 'select'
+  kind: 'toggle' | 'float' | 'int' | 'action' | 'select' | 'text' | 'textarea' | 'color' | 'progress' | 'custom' | 'radio' | 'multiselect' | 'heading' | 'separator'
   label: string
   hint: string
   // 能力不支持时为假，控件照画但置灰，玩家能看到这个功能确实存在
@@ -10,6 +10,17 @@ export type PanelControl = {
   max: number
   step: number
   format: string
+  text: string
+  placeholder: string
+  html: string
+  script: string
+  style: string
+  // Custom 资源的相对路径。运行时会先读取文件并填充上面的内联字段，
+  // 这里保留路径方便调试、工具链展示以及兼容旧版 schema。
+  htmlFile: string
+  scriptFile: string
+  styleFile: string
+  readOnly: boolean
   // 依赖同一分区里另一个控件，值为真才显示，前置叹号取反
   visibleWhen: string
   options?: { value: string; label: string }[]
@@ -91,8 +102,17 @@ export async function readValue(id: string): Promise<number | undefined> {
   return typeof result?.value === 'number' ? result.value : undefined
 }
 
+export async function readText(id: string): Promise<string | undefined> {
+  const result = await call<{ ok?: boolean; value?: unknown }>('panel.getText', { id })
+  return typeof result?.value === 'string' ? result.value : undefined
+}
+
 export async function writeValue(id: string, value: number | boolean): Promise<void> {
   await callQuiet('panel.set', { id, value })
+}
+
+export async function writeText(id: string, value: string): Promise<void> {
+  await callQuiet('panel.setText', { id, value })
 }
 
 export async function runAction(id: string): Promise<void> {

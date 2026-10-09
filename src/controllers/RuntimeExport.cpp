@@ -272,11 +272,11 @@ void DrawText(float x, float y, std::uint32_t color, const char* value) {
 }
 
 int VersionString(char* buffer, std::uint32_t capacity) {
-    return CopyText(XBase::kVersionString, buffer, capacity);
+    return CopyText(XBase::GetVersionString(), buffer, capacity);
 }
 
 std::uint32_t VersionNumber() {
-    return XBase::kVersionNumber;
+    return XBase::GetVersionNumber();
 }
 
 int PanelMount(const char* specJson) {
@@ -291,12 +291,24 @@ int PanelBindValue(const char* controlId, double (*read)(void*), void (*write)(d
     return XBase::Panel::Abi::BindValueRaw(controlId, read, write, userData);
 }
 
+int PanelBindText(
+    const char* controlId,
+    int (*read)(char*, std::uint32_t, void*),
+    void (*write)(const char*, void*),
+    void* userData) {
+    return XBase::Panel::Abi::BindTextRaw(controlId, read, write, userData);
+}
+
 int PanelBindAction(const char* controlId, void (*run)(void*), void* userData) {
     return XBase::Panel::Abi::BindActionRaw(controlId, run, userData);
 }
 
 void PanelNotifyChanged(const char* controlId, double value) {
     XBase::Panel::Abi::NotifyChangedName(controlId, value);
+}
+
+void PanelNotifyTextChanged(const char* controlId, const char* value) {
+    XBase::Panel::Abi::NotifyTextChangedName(controlId, value);
 }
 
 int PanelAvailable() {
@@ -372,8 +384,10 @@ XBaseRuntime BuildTable() {
     table.panelMount = &PanelMount;
     table.panelUnmount = &PanelUnmount;
     table.panelBindValue = &PanelBindValue;
+    table.panelBindText = &PanelBindText;
     table.panelBindAction = &PanelBindAction;
     table.panelNotifyChanged = &PanelNotifyChanged;
+    table.panelNotifyTextChanged = &PanelNotifyTextChanged;
     table.panelAvailable = &PanelAvailable;
     table.panelShow = &PanelShow;
     table.panelHide = &PanelHide;

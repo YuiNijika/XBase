@@ -168,6 +168,16 @@ XBase::Panel::SetHotkey(XBase::Input::Hotkey{XBase::Input::Key::P, 0});
 cd panel && npm install && npm run build
 ```
 
+`ControlKind::Custom` 支持内联 HTML / JavaScript / CSS，也支持从模组目录加载独立文件，二者可以混用：
+
+```cpp
+custom.htmlFile = "ui/custom.html";
+custom.scriptFile = "ui/custom.js";
+custom.styleFile = "ui/custom.css";
+```
+
+文件路径相对于 `XBase\Mods\<modId>\`，文件字段优先；读取失败时对应的 `html`、`script`、`style` 内联字段仍会作为 fallback。路径会拒绝绝对路径、盘符路径和 `..` 穿越。
+
 ## 示例骨架
 
 `example/` 下四份可以直接拷出来改的骨架，都是单文件 asi 形态：

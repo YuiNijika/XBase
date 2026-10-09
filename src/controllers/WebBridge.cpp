@@ -23,6 +23,8 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <utility>
 
 namespace {
@@ -30,6 +32,7 @@ namespace {
 constexpr int ProtocolVersion = 1;
 
 std::unordered_map<std::string, XBase::WebBridge::MethodHandler> s_customMethods;
+std::unordered_set<XBase::WebView::WebViewId> s_installedInstances;
 
 // 页面脚本注入，网页侧用 window.xbase.call 拿 Promise，用 on 订阅原生事件
 const char* const ClientScript = R"JS(
@@ -1360,23 +1363,27 @@ void UnregisterMethod(const std::string& method) {
 }
 
 void Install() {
-    if (s_installed) {
-        return;
-    }
+    Install(XBase::WebView::CurrentInstance());
+}
 
-    XBase::WebView::SetMessageHandler(HandleMessage);
-    XBase::WebView::InjectScript(ClientScript);
+void Install(XBase::WebView::WebViewId id) {
+    XBase::WebView::SetMessageHandler(id, HandleMessage);
+    XBase::WebView::InjectScript(id, ClientScript);
+    s_installedInstances.insert(id);
     s_installed = true;
-    XBase::Log::Info("WebBridge: 已注册网页调用通道");
+    if (id == XBase::WebView::DefaultInstance) {
+        XBase::Log::Info("WebBridge: 已注册网页调用通道");
+    }
 }
 
 void Shutdown() {
-    if (!s_installed) {
-        return;
-    }
+    Shutdown(XBase::WebView::CurrentInstance());
+}
 
-    XBase::WebView::SetMessageHandler(nullptr);
-    s_installed = false;
+void Shutdown(XBase::WebView::WebViewId id) {
+    XBase::WebView::SetMessageHandler(id, nullptr);
+    s_installedInstances.erase(id);
+    s_installed = !s_installedInstances.empty();
 }
 
 bool IsInstalled() {
@@ -1391,7 +1398,28 @@ bool Emit(const std::string& event, const Json::Value& payload) {
     Json::Value message;
     message.Set("event", Json::Value(event));
     message.Set("payload", payload);
-    return XBase::WebView::PostJson(message.Serialize(false));
+    const std::string json = message.Serialize(false);
+    const XBase::WebView::WebViewId current = XBase::WebView::CurrentInstance();
+    if (current != XBase::WebView::DefaultInstance) {
+        return XBase::WebView::PostJson(current, json);
+    }
+
+    bool sent = false;
+    for (const XBase::WebView::WebViewId id : s_installedInstances) {
+        sent = XBase::WebView::PostJson(id, json) || sent;
+    }
+    return sent;
+}
+
+bool Emit(XBase::WebView::WebViewId id, const std::string& event, const Json::Value& payload) {
+    if (!s_installed || event.empty()) {
+        return false;
+    }
+
+    Json::Value message;
+    message.Set("event", Json::Value(event));
+    message.Set("payload", payload);
+    return XBase::WebView::PostJson(id, message.Serialize(false));
 }
 
 } // namespace XBase::WebBridge

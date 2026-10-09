@@ -1,16 +1,18 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/cn'
-import { runAction, writeValue, type PanelControl, type PanelSection } from '@/lib/bridge'
+import { call, runAction, writeText, writeValue, type PanelControl, type PanelSection } from '@/lib/bridge'
 
 type SectionListProps = {
   sections: PanelSection[]
   values: Record<string, number>
+  textValues: Record<string, string>
   onValue: (id: string, next: number) => void
+  onTextValue: (id: string, next: string) => void
 }
 
 // 按宿主下发的分区依次渲染。能力门控与版本筛选宿主已经做过，
 // 这里只处理界面内部的显隐依赖
-export function SectionList({ sections, values, onValue }: SectionListProps) {
+export function SectionList({ sections, values, textValues, onValue, onTextValue }: SectionListProps) {
   if (sections.length === 0) {
     return <p className="text-sm text-muted-foreground">这个模组没有登记任何界面</p>
   }
@@ -22,14 +24,28 @@ export function SectionList({ sections, values, onValue }: SectionListProps) {
           key={section.id}
           section={section}
           values={values}
+          textValues={textValues}
           onValue={onValue}
+          onTextValue={onTextValue}
         />
       ))}
     </div>
   )
 }
 
-function Section({ section, values, onValue }: { section: PanelSection; values: Record<string, number>; onValue: (id: string, next: number) => void }) {
+function Section({
+  section,
+  values,
+  textValues,
+  onValue,
+  onTextValue,
+}: {
+  section: PanelSection
+  values: Record<string, number>
+  textValues: Record<string, string>
+  onValue: (id: string, next: number) => void
+  onTextValue: (id: string, next: string) => void
+}) {
   const controls = section.controls.filter((control) => visible(control, values))
   if (controls.length === 0) return null
 
@@ -49,7 +65,9 @@ function Section({ section, values, onValue }: { section: PanelSection; values: 
               control={control}
               disabled={!section.enabled}
               value={values[control.id]}
+              textValue={textValues[control.id]}
               onValue={onValue}
+              onTextValue={onTextValue}
             />
           ))}
         </div>
@@ -61,7 +79,9 @@ function Section({ section, values, onValue }: { section: PanelSection; values: 
               control={control}
               disabled={!section.enabled}
               value={values[control.id]}
+              textValue={textValues[control.id]}
               onValue={onValue}
+              onTextValue={onTextValue}
             />
           ))}
         </div>
@@ -87,12 +107,16 @@ function ControlRow({
   control,
   disabled,
   value,
+  textValue,
   onValue,
+  onTextValue,
 }: {
   control: PanelControl
   disabled: boolean
   value: number | undefined
+  textValue: string | undefined
   onValue: (id: string, next: number) => void
+  onTextValue: (id: string, next: string) => void
 }) {
   if (control.kind === 'toggle') {
     const checked = value !== undefined && value !== 0
@@ -141,6 +165,57 @@ function ControlRow({
     )
   }
 
+  if (control.kind === 'text' || control.kind === 'textarea') {
+    return (
+      <TextRow
+        control={control}
+        disabled={disabled || !control.enabled}
+        value={textValue ?? ''}
+        onValue={onTextValue}
+      />
+    )
+  }
+
+  if (control.kind === 'color') {
+    return (
+      <ColorRow
+        control={control}
+        disabled={disabled || !control.enabled}
+        value={value}
+        onValue={onValue}
+      />
+    )
+  }
+
+  if (control.kind === 'radio') {
+    return <RadioRow control={control} disabled={disabled || !control.enabled} value={value} onValue={onValue} />
+  }
+
+  if (control.kind === 'multiselect') {
+    return <MultiSelectRow control={control} disabled={disabled || !control.enabled} value={value} onValue={onValue} />
+  }
+
+  if (control.kind === 'progress') {
+    return <ProgressRow control={control} value={value} />
+  }
+
+  if (control.kind === 'heading') {
+    return (
+      <div className="grid gap-1">
+        <div className="text-sm font-semibold">{control.label}</div>
+        {control.hint ? <div className="text-xs text-muted-foreground">{control.hint}</div> : null}
+      </div>
+    )
+  }
+
+  if (control.kind === 'separator') {
+    return <div className="h-px bg-border/60" aria-hidden="true" />
+  }
+
+  if (control.kind === 'custom') {
+    return <CustomControl control={control} disabled={disabled || !control.enabled} />
+  }
+
   return (
     <button
       type="button"
@@ -155,6 +230,247 @@ function ControlRow({
     >
       {control.label}
     </button>
+  )
+}
+
+function TextRow({
+  control,
+  disabled,
+  value,
+  onValue,
+}: {
+  control: PanelControl
+  disabled: boolean
+  value: string
+  onValue: (id: string, next: string) => void
+}) {
+  const [text, setText] = useState(value)
+
+  useEffect(() => setText(value), [value])
+
+  const commit = (next: string) => {
+    onValue(control.id, next)
+    void writeText(control.id, next)
+  }
+
+  if (control.readOnly) {
+    return (
+      <div className="grid gap-1 text-sm">
+        <span className="font-medium">{control.label}</span>
+        <div className="min-h-8 rounded-md border border-border bg-muted/30 px-2 py-1.5 whitespace-pre-wrap text-muted-foreground">
+          {value || control.text || control.placeholder}
+        </div>
+      </div>
+    )
+  }
+
+  if (control.kind === 'textarea') {
+    return (
+      <label className="grid gap-1 text-sm">
+        <span className="font-medium">{control.label}</span>
+        <textarea
+          className="min-h-24 resize-y rounded-md border border-input bg-background px-2 py-1.5 text-foreground disabled:opacity-50"
+          value={text}
+          placeholder={control.placeholder}
+          disabled={disabled}
+          onChange={(event) => setText(event.currentTarget.value)}
+          onBlur={() => commit(text)}
+        />
+        {control.hint ? <span className="text-xs text-muted-foreground">{control.hint}</span> : null}
+      </label>
+    )
+  }
+
+  return (
+    <label className="flex items-center gap-2 text-sm">
+      <span className="min-w-0 flex-1 truncate">{control.label}</span>
+      <input
+        className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm text-foreground disabled:opacity-50"
+        value={text}
+        placeholder={control.placeholder}
+        disabled={disabled}
+        onChange={(event) => setText(event.currentTarget.value)}
+        onBlur={() => commit(text)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') commit(text)
+        }}
+      />
+    </label>
+  )
+}
+
+function ColorRow({
+  control,
+  disabled,
+  value,
+  onValue,
+}: {
+  control: PanelControl
+  disabled: boolean
+  value: number | undefined
+  onValue: (id: string, next: number) => void
+}) {
+  const packed = Math.max(0, Math.round(value ?? 0))
+  const hex = `#${(packed & 0xffffff).toString(16).padStart(6, '0')}`
+  return (
+    <label className="flex items-center justify-between gap-3 text-sm">
+      <span className="min-w-0 truncate">{control.label}</span>
+      <input
+        type="color"
+        className="h-8 w-12 cursor-pointer rounded-md border border-input bg-background p-0.5 disabled:opacity-50"
+        value={hex}
+        disabled={disabled || control.readOnly}
+        onChange={(event) => {
+          const next = Number.parseInt(event.currentTarget.value.slice(1), 16)
+          onValue(control.id, next)
+          void writeValue(control.id, next)
+        }}
+        aria-label={control.label}
+      />
+    </label>
+  )
+}
+
+function RadioRow({
+  control,
+  disabled,
+  value,
+  onValue,
+}: {
+  control: PanelControl
+  disabled: boolean
+  value: number | undefined
+  onValue: (id: string, next: number) => void
+}) {
+  const selected = Math.round(value ?? 0)
+  return (
+    <fieldset className="grid gap-1.5 text-sm">
+      <legend className="font-medium">{control.label}</legend>
+      <div className="flex flex-wrap gap-2">
+        {(control.options ?? []).map((option, index) => (
+          <label key={option.value} className={cn('flex items-center gap-1.5', disabled && 'opacity-50')}>
+            <input
+              type="radio"
+              name={control.id}
+              checked={selected === index}
+              disabled={disabled}
+              onChange={() => {
+                onValue(control.id, index)
+                void writeValue(control.id, index)
+              }}
+            />
+            <span>{option.label}</span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  )
+}
+
+function MultiSelectRow({
+  control,
+  disabled,
+  value,
+  onValue,
+}: {
+  control: PanelControl
+  disabled: boolean
+  value: number | undefined
+  onValue: (id: string, next: number) => void
+}) {
+  const mask = Math.max(0, Math.round(value ?? 0))
+  return (
+    <fieldset className="grid gap-1.5 text-sm">
+      <legend className="font-medium">{control.label}</legend>
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        {(control.options ?? []).map((option, index) => {
+          const bit = 1 << index
+          const checked = (mask & bit) !== 0
+          return (
+            <label key={option.value} className={cn('flex items-center gap-1.5', disabled && 'opacity-50')}>
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={disabled}
+                onChange={() => {
+                  const next = checked ? mask & ~bit : mask | bit
+                  onValue(control.id, next)
+                  void writeValue(control.id, next)
+                }}
+              />
+              <span>{option.label}</span>
+            </label>
+          )
+        })}
+      </div>
+    </fieldset>
+  )
+}
+
+function ProgressRow({ control, value }: { control: PanelControl; value: number | undefined }) {
+  const min = control.min
+  const max = control.max > min ? control.max : 1
+  const current = Math.min(max, Math.max(min, value ?? min))
+  const ratio = ((current - min) / (max - min)) * 100
+  return (
+    <div className="grid gap-1 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="min-w-0 truncate">{control.label}</span>
+        <span className="shrink-0 tabular-nums text-muted-foreground">{formatValue(control, current)}</span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuemin={min} aria-valuemax={max} aria-valuenow={current}>
+        <div className="h-full rounded-full bg-primary transition-[width] duration-150" style={{ width: `${ratio}%` }} />
+      </div>
+    </div>
+  )
+}
+
+function CustomControl({ control, disabled }: { control: PanelControl; disabled: boolean }) {
+  const rootRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+    root.innerHTML = control.html || ''
+    if (control.style) {
+      const style = document.createElement('style')
+      style.textContent = control.style
+      root.prepend(style)
+    }
+    if (!control.script) return
+
+    try {
+      const cleanup = new Function('root', 'xbase', control.script)(
+        root,
+        {
+          root,
+          call,
+          get: (id: string) => call('panel.get', { id }),
+          set: (id: string, value: number | boolean) => call('panel.set', { id, value }),
+          getText: (id: string) => call('panel.getText', { id }),
+          setText: (id: string, value: string) => call('panel.setText', { id, value }),
+          run: (id: string) => call('panel.run', { id }),
+          on: (event: string, callback: (payload: unknown) => void) => {
+            window.xbase?.on(event, callback)
+          },
+        },
+      )
+      return typeof cleanup === 'function' ? cleanup : undefined
+    } catch (error) {
+      console.error(`XBase custom panel control "${control.id}" failed`, error)
+      return undefined
+    }
+  }, [control.html, control.script, control.style])
+
+  return (
+    <div
+      className={cn(
+        'min-h-8 rounded-md border border-border/70 bg-muted/20 p-3',
+        disabled && 'pointer-events-none opacity-50',
+      )}
+      aria-label={control.label || undefined}
+      ref={rootRef}
+    />
   )
 }
 

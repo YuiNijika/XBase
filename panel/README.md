@@ -10,10 +10,10 @@
 |---|---|---|
 | 挂载 API | `XBase/include/XBase/Panel.h` | 模组调用 |
 | 注册表 | `XBase{ver}.dll` 内的 `Panel.cpp` | 共享运行时，进程内唯一 |
-| 桥接方法 | `panel.schema` / `get` / `set` / `run` / `hide` / `setSize` / `setPos` / `rect` | 共享运行时注册 |
+| 桥接方法 | `panel.schema` / `get` / `set` / `getText` / `setText` / `run` / `hide` / `setSize` / `setPos` / `rect` | 共享运行时注册 |
 | 前端 | `panel/dist` → `XBase\Library\panel\` | 随 XBase 分发 |
 
-模组侧不写 HTML、不写 JS、不带资源。
+默认模式下模组侧不写 HTML、不写 JS、不带资源；需要完全自定义时可使用 `custom` 控件提供 HTML/CSS/JS。Custom 同时支持内联内容和独立文件，二者可以混用。
 
 ## 构建
 
@@ -39,14 +39,55 @@ React 19 + Vite + TypeScript + Tailwind 4。不引组件库，开关、拖动条
 | `panel.schema` | — | 全部挂载内容、游戏版本、上次打开的模组 |
 | `panel.get` | `{ id }` | `{ ok, value }`，值是 double |
 | `panel.set` | `{ id, value }` | `{ ok }` |
+| `panel.getText` | `{ id }` | `{ ok, value }`，值是 string |
+| `panel.setText` | `{ id, value }` | `{ ok }` |
 | `panel.run` | `{ id }` | `{ ok }` |
 | `panel.hide` | — | `{ ok }` |
 | `panel.setSize` / `panel.setPos` | `{ width, height }` / `{ x, y }` | `{ ok }` |
 | `panel.rect` | — | `{ x, y, width, height }` |
 
 原生往网页推事件 `panel.changed`，载荷 `{ id, value }`，模组自己在游戏里改了状态时用它刷新显示。
+文本控件对应事件是 `panel.textChanged`。
 
 值的约定：开关是 0 与 1，数值直接读写，下拉读写的是 `options` 下标。C 接口上因此不必传任何 STL 容器，跨模块也就没有 CRT 堆不匹配的问题。
+
+## 控件类型
+
+除 `toggle`、`float`、`int`、`select`、`action` 外，还支持：
+
+- `text`：单行文本，配合 `Panel::BindText` 使用；`readOnly=true` 时只展示。
+- `textarea`：多行文本，失焦或回车时提交。
+- `color`：颜色选择器，值按 `0xRRGGBB` 的数字传递。
+- `progress`：只读进度条，使用 `min` / `max` / `format`。
+- `radio`：单选组，值是 `options` 的下标。
+- `multiselect`：复选组，值是按选项下标编码的 bitmask。
+- `heading` / `separator`：纯布局控件，不需要绑定。
+- `custom`：直接渲染模组提供的 `html`、`style`，并执行 `script`。也可以用 `htmlFile`、`styleFile`、`scriptFile` 从模组目录加载独立资源。
+
+`custom.script` 接收 `(root, xbase)` 两个参数。`xbase` 提供 `call`、`get`、`set`、`getText`、`setText`、`run`、`on`，例如：
+
+```js
+const button = root.querySelector('[data-action="reset"]')
+button?.addEventListener('click', () => xbase.run('example.reset'))
+```
+
+### 独立 HTML / JavaScript / CSS 文件
+
+文件路径相对于 `XBase\Mods\<modId>\`，推荐把面板资源放到模组自己的 `ui/` 目录：
+
+```cpp
+XBase::Panel::Control custom;
+custom.kind = XBase::Panel::ControlKind::Custom;
+custom.id = "mymod.tools";
+custom.label = "工具";
+custom.htmlFile = "ui/tools.html";
+custom.scriptFile = "ui/tools.js";
+custom.styleFile = "ui/tools.css";
+```
+
+构建时将 `ui/` 复制到 `XBase\Mods\<modId>\ui\`，运行时在 `Panel::Mount` 时读取文件。文件字段优先于对应的 `html`、`script`、`style` 内联字段；文件不存在、路径不安全或读取失败时，会记录警告并保留内联内容作为 fallback。因此可以只把其中一部分拆成文件，也可以文件与内联混用。
+
+文件路径只能使用模组目录内的相对路径，不能使用盘符、绝对路径或 `..` 穿越目录。独立脚本与内联脚本使用完全相同的 `(root, xbase)` 约定，返回函数时控件销毁会调用该函数清理事件监听。自定义内容来自已加载的 ASI，请只挂载可信模组。
 
 ## 排查路径
 

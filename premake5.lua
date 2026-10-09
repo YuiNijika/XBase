@@ -44,6 +44,7 @@ local ENTRY_SUPPORT_SOURCES = {
     "src/controllers/Package.cpp",
     "src/controllers/Json.cpp",
     "src/controllers/Platform.cpp",
+    "src/Version.cpp",
 }
 
 local function add_entry_target(name, sources)
@@ -118,8 +119,11 @@ local function add_portable_player_target(name, sdkName, gameName, gameDefine, b
         targetname(name)
         files {
             "include/XBase/**.h",
+            "src/Version.cpp",
             "src/backends/BulletAssistBackend.h",
             "src/backends/BulletAssistBackend_" .. string.lower(sdkName) .. ".cpp",
+            "src/backends/TargetingBackend.h",
+            "src/backends/TargetingBackend_" .. string.lower(sdkName) .. ".cpp",
             "src/backends/RuntimeGuard_" .. string.lower(sdkName) .. ".cpp",
             "src/backends/PlayerBackend.h",
             "src/backends/PlayerBackend_" .. string.lower(sdkName) .. ".cpp",
@@ -141,6 +145,7 @@ local function add_portable_player_target(name, sdkName, gameName, gameDefine, b
             "src/backends/CheatsBackend_" .. string.lower(sdkName) .. ".cpp",
             "src/controllers/Capabilities.cpp",
             "src/controllers/BulletAssist.cpp",
+            "src/controllers/Targeting.cpp",
             "src/controllers/CheatsPortable.cpp",
             "src/controllers/Config.cpp",
             "src/controllers/CoreStub.cpp",
@@ -224,11 +229,14 @@ project "XBaseSA"
     files {
         "include/XBase/**.h",
         "src/**.h",
+        "src/Version.cpp",
         "src/controllers/*.cpp",
         "src/controllers/Camera.cpp",
         "src/controllers/Cheats.cpp",
         "src/controllers/VehicleEffects.cpp",
         "src/backends/BulletAssistBackend_sa.cpp",
+        "src/backends/TargetingBackend.h",
+        "src/backends/TargetingBackend_sa.cpp",
         "src/backends/RuntimeGuard_sa.cpp",
         "include/imgui/imgui.cpp",
         "include/imgui/imgui_draw.cpp",
@@ -307,6 +315,8 @@ local function add_runtime_target(projectName, targetName, sdkName, gameName, ga
                 "include/XBase/**.h",
                 "src/backends/BulletAssistBackend.h",
                 "src/backends/BulletAssistBackend_" .. string.lower(sdkName) .. ".cpp",
+                "src/backends/TargetingBackend.h",
+                "src/backends/TargetingBackend_" .. string.lower(sdkName) .. ".cpp",
                 "src/backends/RuntimeGuard_" .. string.lower(sdkName) .. ".cpp",
                 "src/backends/PlayerBackend.h",
                 "src/backends/PlayerBackend_" .. string.lower(sdkName) .. ".cpp",
@@ -328,6 +338,7 @@ local function add_runtime_target(projectName, targetName, sdkName, gameName, ga
                 "src/backends/CheatsBackend_" .. string.lower(sdkName) .. ".cpp",
                 "src/controllers/Capabilities.cpp",
                 "src/controllers/BulletAssist.cpp",
+                "src/controllers/Targeting.cpp",
                 "src/controllers/CheatsPortable.cpp",
                 "src/controllers/Config.cpp",
                 "src/controllers/CoreStub.cpp",
@@ -376,6 +387,8 @@ local function add_runtime_target(projectName, targetName, sdkName, gameName, ga
                 "src/**.h",
                 "src/controllers/*.cpp",
                 "src/backends/BulletAssistBackend_sa.cpp",
+                "src/backends/TargetingBackend.h",
+                "src/backends/TargetingBackend_sa.cpp",
                 "src/backends/RuntimeGuard_sa.cpp",
                 "src/controllers/RuntimeExport.cpp",
                 "include/imgui/imgui.cpp",

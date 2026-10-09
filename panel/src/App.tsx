@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 import { Shell } from '@/components/shell'
 import { SectionList } from '@/components/section'
-import { callQuiet, fetchSchema, isBridgeAvailable, on, readValue, type PanelMod, type PanelSchema } from '@/lib/bridge'
+import { callQuiet, fetchSchema, isBridgeAvailable, on, readText, readValue, type PanelMod, type PanelSchema } from '@/lib/bridge'
 
 export default function App() {
   const [schema, setSchema] = useState<PanelSchema | null>(null)
@@ -10,6 +10,7 @@ export default function App() {
   const [activeModId, setActiveModId] = useState('')
   const [activePageId, setActivePageId] = useState('')
   const [values, setValues] = useState<Record<string, number>>({})
+  const [textValues, setTextValues] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (!isBridgeAvailable()) {
@@ -48,7 +49,15 @@ export default function App() {
     if (!activePage) return [] as string[]
     return activePage.sections
       .flatMap((section) => section.controls)
-      .filter((control) => control.kind !== 'action')
+      .filter((control) => ['toggle', 'float', 'int', 'select', 'color', 'progress', 'radio', 'multiselect'].includes(control.kind))
+      .map((control) => control.id)
+  }, [activePage])
+
+  const textControlIds = useMemo(() => {
+    if (!activePage) return [] as string[]
+    return activePage.sections
+      .flatMap((section) => section.controls)
+      .filter((control) => control.kind === 'text' || control.kind === 'textarea')
       .map((control) => control.id)
   }, [activePage])
 
@@ -76,6 +85,22 @@ export default function App() {
     }
   }, [controlIds])
 
+  useEffect(() => {
+    if (textControlIds.length === 0) return
+    let alive = true
+    void Promise.all(textControlIds.map(async (id) => [id, await readText(id).catch(() => undefined)] as const)).then((entries) => {
+      if (!alive) return
+      const next: Record<string, string> = {}
+      for (const [id, value] of entries) {
+        if (value !== undefined) next[id] = value
+      }
+      setTextValues(next)
+    })
+    return () => {
+      alive = false
+    }
+  }, [textControlIds])
+
   // 模组自己在游戏里改了状态时推事件过来，显示跟着走
   useEffect(() => {
     on('panel.changed', (payload) => {
@@ -83,10 +108,19 @@ export default function App() {
       if (!detail?.id || typeof detail.value !== 'number') return
       setValues((previous) => ({ ...previous, [detail.id as string]: detail.value as number }))
     })
+    on('panel.textChanged', (payload) => {
+      const detail = payload as { id?: string; value?: string } | null
+      if (!detail?.id || typeof detail.value !== 'string') return
+      setTextValues((previous) => ({ ...previous, [detail.id as string]: detail.value as string }))
+    })
   }, [])
 
   const onValue = useCallback((id: string, next: number) => {
     setValues((previous) => ({ ...previous, [id]: next }))
+  }, [])
+
+  const onTextValue = useCallback((id: string, next: string) => {
+    setTextValues((previous) => ({ ...previous, [id]: next }))
   }, [])
 
   if (error) {
@@ -145,7 +179,13 @@ export default function App() {
       onClose={() => void callQuiet('panel.hide')}
     >
       {activeMod && activePage ? (
-        <SectionList sections={activePage.sections} values={values} onValue={onValue} />
+        <SectionList
+          sections={activePage.sections}
+          values={values}
+          textValues={textValues}
+          onValue={onValue}
+          onTextValue={onTextValue}
+        />
       ) : (
         <p className="text-sm text-muted-foreground">没有模组挂载界面</p>
       )}

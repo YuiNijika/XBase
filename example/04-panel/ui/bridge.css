@@ -1,0 +1,30 @@
+.panel-demo-bridge {
+  display: grid;
+  gap: 8px;
+}
+
+.panel-demo-bridge__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.panel-demo-bridge button {
+  border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  color: inherit;
+  cursor: pointer;
+}
+
+.panel-demo-bridge button:hover {
+  background: color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.panel-demo-bridge pre {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+}

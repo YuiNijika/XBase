@@ -412,9 +412,9 @@ bool Validate(
     }
 
     std::string problems;
-    if (!SatisfiesText(info.xbaseRequirement, kVersionString)) {
+    if (!SatisfiesText(info.xbaseRequirement, GetVersionString())) {
         problems += "XBase " + (info.xbaseRequirement.empty() ? std::string("*") : info.xbaseRequirement)
-            + " is required, installed is " + kVersionString;
+            + " is required, installed is " + GetVersionString();
     }
 
     // 依赖分两类：名字对应其它 mod 的按对方清单版本校验；
@@ -437,7 +437,7 @@ bool Validate(
     }
     if (warningReason) {
         *warningReason = "XBase warning: package requirements are not satisfied; the mod will continue to load.\n\n"
-            "Mod: " + info.name + "\nInstalled XBase: " + kVersionString + "\n\n" + problems;
+            "Mod: " + info.name + "\nInstalled XBase: " + GetVersionString() + "\n\n" + problems;
     }
     return true;
 }

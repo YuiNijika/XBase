@@ -25,8 +25,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <cwchar>
 #include <mutex>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
@@ -45,6 +49,7 @@ using GetBrowserVersionStringFn = HRESULT(STDAPICALLTYPE*)(
     LPWSTR* versionInfo);
 
 constexpr const wchar_t* kHostWindowClass = L"XBaseWebViewHost";
+constexpr const wchar_t* kHostWindowMarker = L"XBase.WebView.Host";
 
 // 抓帧模式参数，包括空闲与交互时的抓帧间隔、全屏状态检测间隔和交互判定阈值。
 // 交互期 33 毫秒约等于 30 帧，再往上加帧率编码解码的开销就会吃满一个核
@@ -91,6 +96,9 @@ struct WebViewState {
     std::string title;
     std::string pendingUrl;
     std::string pendingHtml;
+    // 关闭控制器后仍要保留最后一次导航请求，下一次显示时才能重建同一页面。
+    std::string sourceUrl;
+    std::string sourceHtml;
     Rect bounds{};
     bool boundsApplied = false;
     float zoom = 1.0f;
@@ -128,11 +136,77 @@ int cursorShows = 0;
 };
 
 Runtime s_runtime;
-WebViewState s_state;
+WebViewState s_defaultState;
+std::unordered_map<XBase::WebView::WebViewId, std::unique_ptr<WebViewState>> s_instances;
+XBase::WebView::WebViewId s_nextInstanceId = 1;
+thread_local WebViewState* t_activeState = nullptr;
+thread_local XBase::WebView::WebViewId t_activeInstance = XBase::WebView::DefaultInstance;
+std::unordered_map<HWND, WebViewState*> s_hostStates;
+
+WebViewState& ActiveState() {
+    return t_activeState ? *t_activeState : s_defaultState;
+}
+
+XBase::WebView::WebViewId ActiveInstance() {
+    return t_activeState ? t_activeInstance : XBase::WebView::DefaultInstance;
+}
+
+class ScopedState {
+public:
+    explicit ScopedState(WebViewState* state, XBase::WebView::WebViewId id)
+        : previousState_(t_activeState), previousId_(t_activeInstance) {
+        t_activeState = state;
+        t_activeInstance = id;
+    }
+    ~ScopedState() {
+        t_activeState = previousState_;
+        t_activeInstance = previousId_;
+    }
+private:
+    WebViewState* previousState_;
+    XBase::WebView::WebViewId previousId_;
+};
+
+WebViewState* FindState(XBase::WebView::WebViewId id) {
+    if (id == XBase::WebView::DefaultInstance) return &s_defaultState;
+    const auto found = s_instances.find(id);
+    return found == s_instances.end() ? nullptr : found->second.get();
+}
+
+XBase::WebView::WebViewId FindInstanceId(WebViewState* state) {
+    if (state == &s_defaultState) return XBase::WebView::DefaultInstance;
+    for (const auto& entry : s_instances) {
+        if (entry.second.get() == state) return entry.first;
+    }
+    return XBase::WebView::DefaultInstance;
+}
+
+WebViewState* StateForActive() {
+    return &ActiveState();
+}
 
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 void DestroyHostWindow();
 void ApplyVirtualHostsLocked(ICoreWebView2* webview);
+
+std::wstring HostWindowClassName() {
+    static const std::wstring name = [] {
+        wchar_t buffer[96]{};
+        std::swprintf(
+            buffer,
+            sizeof(buffer) / sizeof(buffer[0]),
+            L"%ls_%p",
+            kHostWindowClass,
+            reinterpret_cast<const void*>(&HostWindowProc));
+        return std::wstring(buffer);
+    }();
+    return name;
+}
+
+UINT HostCloseMessage() {
+    static const UINT message = RegisterWindowMessageW(L"XBase.WebView.Close");
+    return message;
+}
 
 std::string ModuleFilePath(const char* fileName) {
     return XBase::Platform::CurrentModuleDirectory() + fileName;
@@ -203,10 +277,10 @@ std::wstring WideFrom(const std::string& value) {
 }
 
 void ApplyVirtualHostsLocked(ICoreWebView2* webview) {
-    if (!webview || s_state.virtualHosts.empty()) return;
+    if (!webview || ActiveState().virtualHosts.empty()) return;
     ICoreWebView2_3* webview3 = nullptr;
     if (FAILED(webview->QueryInterface(IID_PPV_ARGS(&webview3))) || !webview3) return;
-    for (const auto& entry : s_state.virtualHosts) {
+    for (const auto& entry : ActiveState().virtualHosts) {
         webview3->SetVirtualHostNameToFolderMapping(
             WideFrom(entry.first).c_str(),
             WideFrom(entry.second).c_str(),
@@ -250,8 +324,8 @@ void RefreshHistoryFlags(ICoreWebView2* webview, bool& canGoBack, bool& canGoFor
 void NotifyStateChanged() {
     XBase::WebView::StateCallback callback = nullptr;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        callback = s_state.stateCallback;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        callback = ActiveState().stateCallback;
     }
     if (callback) {
         callback();
@@ -259,10 +333,10 @@ void NotifyStateChanged() {
 }
 
 void ApplyBoundsLocked() {
-    if (!s_state.hostWindow || !s_state.gameWindow) return;
+    if (!ActiveState().hostWindow || !ActiveState().gameWindow) return;
 
     RECT client{};
-    if (!GetClientRect(s_state.gameWindow, &client)) return;
+    if (!GetClientRect(ActiveState().gameWindow, &client)) return;
 
     float displayWidth = 0.0f;
     float displayHeight = 0.0f;
@@ -276,10 +350,10 @@ void ApplyBoundsLocked() {
         scaleY = static_cast<float>(client.bottom) / displayHeight;
     }
 
-    int left = static_cast<int>(s_state.bounds.left * scaleX);
-    int top = static_cast<int>(s_state.bounds.top * scaleY);
-    int width = static_cast<int>((s_state.bounds.right - s_state.bounds.left) * scaleX);
-    int height = static_cast<int>((s_state.bounds.bottom - s_state.bounds.top) * scaleY);
+    int left = static_cast<int>(ActiveState().bounds.left * scaleX);
+    int top = static_cast<int>(ActiveState().bounds.top * scaleY);
+    int width = static_cast<int>((ActiveState().bounds.right - ActiveState().bounds.left) * scaleX);
+    int height = static_cast<int>((ActiveState().bounds.bottom - ActiveState().bounds.top) * scaleY);
     if (width <= 0) width = 1;
     if (height <= 0) height = 1;
     if (left + width > client.right) width = client.right - left;
@@ -288,15 +362,15 @@ void ApplyBoundsLocked() {
     if (height <= 0) height = 1;
 
     SetWindowPos(
-        s_state.hostWindow, nullptr,
+        ActiveState().hostWindow, nullptr,
         left, top, width, height,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 
-    if (s_state.controller) {
+    if (ActiveState().controller) {
         RECT bounds{0, 0, width, height};
-        s_state.controller->put_Bounds(bounds);
+        ActiveState().controller->put_Bounds(bounds);
     }
-    s_state.boundsApplied = true;
+    ActiveState().boundsApplied = true;
 
     static RECT lastLogged{};
     if (client.right != lastLogged.right || client.bottom != lastLogged.bottom
@@ -329,88 +403,160 @@ bool IsExclusiveFullscreen() {
 }
 
 void ApplyVisibleLocked() {
-    if (!s_state.hostWindow) return;
+    if (!ActiveState().hostWindow) return;
     // 独占全屏下抓帧模式不接受焦点，否则游戏会失去键盘输入
     const bool captureMode = IsExclusiveFullscreen();
-    if (s_state.controller) {
-        s_state.controller->put_IsVisible(s_state.visible ? TRUE : FALSE);
+    if (ActiveState().controller) {
+        ActiveState().controller->put_IsVisible(ActiveState().visible ? TRUE : FALSE);
     }
-    ShowWindow(s_state.hostWindow, s_state.visible ? SW_SHOWNOACTIVATE : SW_HIDE);
-    if (s_state.visible) {
+    ShowWindow(ActiveState().hostWindow, ActiveState().visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    if (ActiveState().visible) {
         if (!captureMode) {
-            SetFocus(s_state.hostWindow);
-            if (s_state.controller) {
-                s_state.controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            SetFocus(ActiveState().hostWindow);
+            if (ActiveState().controller) {
+                ActiveState().controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
             }
-        } else if (s_state.gameWindow) {
-            SetFocus(s_state.gameWindow);
+        } else if (ActiveState().gameWindow) {
+            SetFocus(ActiveState().gameWindow);
         }
-    } else if (s_state.gameWindow) {
-        SetFocus(s_state.gameWindow);
+    } else if (ActiveState().gameWindow) {
+        SetFocus(ActiveState().gameWindow);
     }
 }
 
 void ApplyZoomLocked() {
-    if (s_state.controller) {
-        s_state.controller->put_ZoomFactor(static_cast<double>(s_state.zoom));
+    if (ActiveState().controller) {
+        ActiveState().controller->put_ZoomFactor(static_cast<double>(ActiveState().zoom));
     }
 }
 
 // 调用方需持有状态锁，异步创建结束后才允许销毁宿主窗口
 void ReleaseControllerLocked() {
-    if (s_state.webview && s_state.tokensRegistered) {
-        s_state.webview->remove_NavigationStarting(s_state.navigationStartingToken);
-        s_state.webview->remove_NavigationCompleted(s_state.navigationCompletedToken);
-        s_state.webview->remove_DocumentTitleChanged(s_state.documentTitleToken);
-        s_state.webview->remove_NewWindowRequested(s_state.newWindowToken);
-        if (s_state.webMessageRegistered) {
-            s_state.webview->remove_WebMessageReceived(s_state.webMessageToken);
-            s_state.webMessageRegistered = false;
+    if (ActiveState().webview && ActiveState().tokensRegistered) {
+        ActiveState().webview->remove_NavigationStarting(ActiveState().navigationStartingToken);
+        ActiveState().webview->remove_NavigationCompleted(ActiveState().navigationCompletedToken);
+        ActiveState().webview->remove_DocumentTitleChanged(ActiveState().documentTitleToken);
+        ActiveState().webview->remove_NewWindowRequested(ActiveState().newWindowToken);
+        if (ActiveState().webMessageRegistered) {
+            ActiveState().webview->remove_WebMessageReceived(ActiveState().webMessageToken);
+            ActiveState().webMessageRegistered = false;
         }
-        s_state.tokensRegistered = false;
+        ActiveState().tokensRegistered = false;
     }
-    if (s_state.controller) {
-        if (s_state.acceleratorKeyRegistered) {
-            s_state.controller->remove_AcceleratorKeyPressed(s_state.acceleratorKeyToken);
-            s_state.acceleratorKeyRegistered = false;
+    if (ActiveState().controller) {
+        if (ActiveState().acceleratorKeyRegistered) {
+            ActiveState().controller->remove_AcceleratorKeyPressed(ActiveState().acceleratorKeyToken);
+            ActiveState().acceleratorKeyRegistered = false;
         }
-        s_state.controller->Close();
-        s_state.controller->Release();
-        s_state.controller = nullptr;
+        ActiveState().controller->Close();
+        ActiveState().controller->Release();
+        ActiveState().controller = nullptr;
     }
-    if (s_state.webview) {
-        s_state.webview->Release();
-        s_state.webview = nullptr;
+    if (ActiveState().webview) {
+        ActiveState().webview->Release();
+        ActiveState().webview = nullptr;
     }
-    if (s_state.environment) {
-        s_state.environment->Release();
-        s_state.environment = nullptr;
+    if (ActiveState().environment) {
+        ActiveState().environment->Release();
+        ActiveState().environment = nullptr;
     }
-    if (s_state.captureStream) {
-        s_state.captureStream->Release();
-        s_state.captureStream = nullptr;
+    if (ActiveState().captureStream) {
+        ActiveState().captureStream->Release();
+        ActiveState().captureStream = nullptr;
     }
-    if (s_state.texture) {
-        s_state.texture->Release();
-        s_state.texture = nullptr;
+    if (ActiveState().texture) {
+        ActiveState().texture->Release();
+        ActiveState().texture = nullptr;
     }
-    s_state.captureInFlight = false;
-    s_state.previewReady = false;
-    s_state.textureWidth = 0;
-    s_state.textureHeight = 0;
-    s_state.previousMouseDown = false;
+    ActiveState().captureInFlight = false;
+    ActiveState().previewReady = false;
+    ActiveState().textureWidth = 0;
+    ActiveState().textureHeight = 0;
+    ActiveState().previousMouseDown = false;
     DestroyHostWindow();
-    s_state.initialized = false;
-    s_state.loading = false;
-    s_state.canGoBack = false;
-    s_state.canGoForward = false;
-    s_state.boundsApplied = false;
+    ActiveState().initialized = false;
+    ActiveState().loading = false;
+    ActiveState().canGoBack = false;
+    ActiveState().canGoForward = false;
+    ActiveState().boundsApplied = false;
+}
+
+// 同一个 XBase WebView 运行时只允许一个可见/创建中的视图。
+// 切换页面时释放旧控制器，避免多个 HWND 与 WebView2 实例争抢输入和焦点。
+void CloseOtherInstances(XBase::WebView::WebViewId keepId) {
+    HWND keepWindow = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        keepWindow = ActiveState().hostWindow;
+    }
+
+    // XMenu 与 XBaseRuntime.dll 可能各自带有一份静态 WebView 代码，
+    // 通过进程内窗口消息把另一份实现持有的宿主也关闭掉。
+    HWND gameWindow = ActiveState().gameWindow;
+    if (!gameWindow) {
+        gameWindow = XBase::Detail::Hooks::GetGameWindow();
+    }
+    if (gameWindow) {
+        struct CloseContext {
+            HWND keep;
+        } context{keepWindow};
+        EnumChildWindows(
+            gameWindow,
+            [](HWND window, LPARAM parameter) -> BOOL {
+                auto* context = reinterpret_cast<CloseContext*>(parameter);
+                if (window == context->keep || !GetPropW(window, kHostWindowMarker)) {
+                    return TRUE;
+                }
+                SendMessageW(window, HostCloseMessage(), 0, 0);
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&context));
+    }
+
+    std::vector<XBase::WebView::WebViewId> ids;
+    if (keepId != XBase::WebView::DefaultInstance) {
+        ids.push_back(XBase::WebView::DefaultInstance);
+    }
+    for (const auto& entry : s_instances) {
+        if (entry.first != keepId) {
+            ids.push_back(entry.first);
+        }
+    }
+
+    for (const XBase::WebView::WebViewId id : ids) {
+        WebViewState* state = FindState(id);
+        if (!state) continue;
+
+        ScopedState scope(state, id);
+        bool shouldClose = false;
+        {
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            shouldClose = ActiveState().visible
+                || ActiveState().initialized
+                || ActiveState().createRequested
+                || ActiveState().createInFlight;
+        }
+        if (!shouldClose) continue;
+
+        {
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().visible = false;
+            ActiveState().createRequested = false;
+            if (ActiveState().createInFlight) {
+                ActiveState().shutdownPending = true;
+            } else {
+                ReleaseControllerLocked();
+            }
+        }
+        XBase::Log::Info(
+            "WebView: 新视图显示前已关闭旧 WebView 实例 " + std::to_string(id));
+    }
 }
 
 void ExecuteScript(const std::string& script) {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (!s_state.webview) return;
-    s_state.webview->ExecuteScript(WideFrom(script).c_str(), nullptr);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (!ActiveState().webview) return;
+    ActiveState().webview->ExecuteScript(WideFrom(script).c_str(), nullptr);
 }
 
 bool DecodeImageToRgba(const std::vector<unsigned char>& data, unsigned char*& pixels, int& width, int& height) {
@@ -435,17 +581,17 @@ bool UploadTextureLocked(const unsigned char* pixels, int width, int height) {
     IDirect3DDevice9* device = XBase::Detail::Hooks::GetD3D9Device();
     if (!device || !pixels || width <= 0 || height <= 0) return false;
 
-    if (!s_state.texture || s_state.textureWidth != width || s_state.textureHeight != height) {
-        if (s_state.texture) {
-            s_state.texture->Release();
-            s_state.texture = nullptr;
+    if (!ActiveState().texture || ActiveState().textureWidth != width || ActiveState().textureHeight != height) {
+        if (ActiveState().texture) {
+            ActiveState().texture->Release();
+            ActiveState().texture = nullptr;
         }
         IDirect3DTexture9* texture = nullptr;
         // 动态纹理配合 DISCARD 整块上传，一次到位；设备不支持再退回托管池
         if (SUCCEEDED(device->CreateTexture(
                 static_cast<UINT>(width), static_cast<UINT>(height), 1,
                 D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &texture, nullptr)) && texture) {
-            s_state.textureDynamic = true;
+            ActiveState().textureDynamic = true;
         } else {
             texture = nullptr;
             if (FAILED(device->CreateTexture(
@@ -453,20 +599,20 @@ bool UploadTextureLocked(const unsigned char* pixels, int width, int height) {
                     0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, nullptr)) || !texture) {
                 return false;
             }
-            s_state.textureDynamic = false;
+            ActiveState().textureDynamic = false;
         }
-        s_state.texture = texture;
-        s_state.textureWidth = width;
-        s_state.textureHeight = height;
+        ActiveState().texture = texture;
+        ActiveState().textureWidth = width;
+        ActiveState().textureHeight = height;
     }
 
     D3DLOCKED_RECT locked{};
-    if (FAILED(s_state.texture->LockRect(0, &locked, nullptr, s_state.textureDynamic ? D3DLOCK_DISCARD : 0))) {
-        s_state.texture->Release();
-        s_state.texture = nullptr;
-        s_state.textureWidth = 0;
-        s_state.textureHeight = 0;
-        s_state.previewReady = false;
+    if (FAILED(ActiveState().texture->LockRect(0, &locked, nullptr, ActiveState().textureDynamic ? D3DLOCK_DISCARD : 0))) {
+        ActiveState().texture->Release();
+        ActiveState().texture = nullptr;
+        ActiveState().textureWidth = 0;
+        ActiveState().textureHeight = 0;
+        ActiveState().previewReady = false;
         return false;
     }
     // 解出来是 RGBA，纹理要 BGRA，逐行边换边拷，读写各过一遍就够
@@ -482,8 +628,8 @@ bool UploadTextureLocked(const unsigned char* pixels, int width, int height) {
             target[offset + 3] = 255;
         }
     }
-    s_state.texture->UnlockRect(0);
-    s_state.previewReady = true;
+    ActiveState().texture->UnlockRect(0);
+    ActiveState().previewReady = true;
     return true;
 }
 
@@ -510,16 +656,18 @@ void StartCapture();
 
 class CaptureCompletedHandler final : public ICoreWebView2CapturePreviewCompletedHandler {
 public:
+    explicit CaptureCompletedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2CapturePreviewCompletedHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         std::vector<unsigned char> data;
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            IStream* stream = s_state.captureStream;
-            s_state.captureStream = nullptr;
-            s_state.captureInFlight = false;
-            s_state.lastCaptureAt = static_cast<unsigned long long>(XBase::Platform::MonotonicMilliseconds());
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            IStream* stream = ActiveState().captureStream;
+            ActiveState().captureStream = nullptr;
+            ActiveState().captureInFlight = false;
+            ActiveState().lastCaptureAt = static_cast<unsigned long long>(XBase::Platform::MonotonicMilliseconds());
 
             if (stream && SUCCEEDED(errorCode)) {
                 STATSTG stat{};
@@ -544,36 +692,38 @@ public:
             int width = 0;
             int height = 0;
             if (DecodeImageToRgba(data, pixels, width, height)) {
-                std::lock_guard<std::mutex> lock(s_state.mutex);
+                std::lock_guard<std::mutex> lock(ActiveState().mutex);
                 UploadTextureLocked(pixels, width, height);
                 stbi_image_free(pixels);
             }
         }
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 void StartCapture() {
     ICoreWebView2* webview = nullptr;
     bool captureActive = false;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        if (s_state.captureInFlight || !s_state.webview || !s_state.visible) return;
-        webview = s_state.webview;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        if (ActiveState().captureInFlight || !ActiveState().webview || !ActiveState().visible) return;
+        webview = ActiveState().webview;
         webview->AddRef();
-        s_state.captureInFlight = true;
-        captureActive = s_state.captureActive;
+        ActiveState().captureInFlight = true;
+        captureActive = ActiveState().captureActive;
     }
 
     IStream* stream = nullptr;
     if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) || !stream) {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        s_state.captureInFlight = false;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        ActiveState().captureInFlight = false;
         webview->Release();
         return;
     }
 
-    auto* handler = new CaptureCompletedHandler();
+    auto* handler = new CaptureCompletedHandler(&ActiveState());
     // 静止时用 PNG 保证清晰度，交互期用 JPEG 压低编码与解码开销
     const COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT format =
         captureActive ? COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG
@@ -582,21 +732,23 @@ void StartCapture() {
     handler->Release();
     webview->Release();
 
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     if (FAILED(hr)) {
         stream->Release();
-        s_state.captureInFlight = false;
+        ActiveState().captureInFlight = false;
         return;
     }
-    s_state.captureStream = stream;
+    ActiveState().captureStream = stream;
 }
 
 // 网页子窗口持有焦点时按键不会到达游戏窗口，转发给 XBase 输入系统以便菜单热键继续工作
 class AcceleratorKeyPressedHandler final : public ICoreWebView2AcceleratorKeyPressedEventHandler {
 public:
+    explicit AcceleratorKeyPressedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2AcceleratorKeyPressedEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2Controller* sender, ICoreWebView2AcceleratorKeyPressedEventArgs* args) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         if (!args) return S_OK;
         COREWEBVIEW2_KEY_EVENT_KIND kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
         if (FAILED(args->get_KeyEventKind(&kind))) return S_OK;
@@ -608,13 +760,17 @@ public:
         XBase::Detail::Input::HandleVirtualKey(static_cast<std::uint32_t>(virtualKey), down, false);
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class NavigationStartingHandler final : public ICoreWebView2NavigationStartingEventHandler {
 public:
+    explicit NavigationStartingHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2NavigationStartingEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         std::string url;
         if (args) {
             LPWSTR uri = nullptr;
@@ -623,21 +779,25 @@ public:
             }
         }
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            s_state.loading = true;
-            s_state.lastError = 0;
-            if (!url.empty()) s_state.url = url;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().loading = true;
+            ActiveState().lastError = 0;
+            if (!url.empty()) ActiveState().url = url;
         }
         NotifyStateChanged();
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class NavigationCompletedHandler final : public ICoreWebView2NavigationCompletedEventHandler {
 public:
+    explicit NavigationCompletedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2NavigationCompletedEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         bool canGoBack = false;
         bool canGoForward = false;
         RefreshHistoryFlags(sender, canGoBack, canGoForward);
@@ -652,39 +812,47 @@ public:
         }
 
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            s_state.loading = false;
-            s_state.canGoBack = canGoBack;
-            s_state.canGoForward = canGoForward;
-            s_state.lastError = error;
-            if (!url.empty()) s_state.url = url;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().loading = false;
+            ActiveState().canGoBack = canGoBack;
+            ActiveState().canGoForward = canGoForward;
+            ActiveState().lastError = error;
+            if (!url.empty()) ActiveState().url = url;
         }
         NotifyStateChanged();
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class DocumentTitleChangedHandler final : public ICoreWebView2DocumentTitleChangedEventHandler {
 public:
+    explicit DocumentTitleChangedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2DocumentTitleChangedEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender, IUnknown*) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         const std::string title = TitleOf(sender);
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            s_state.title = title;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().title = title;
         }
         NotifyStateChanged();
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 // 网页用 postMessage 发来的 JSON 原样转给宿主注册的处理函数
 class WebMessageReceivedHandler final : public ICoreWebView2WebMessageReceivedEventHandler {
 public:
+    explicit WebMessageReceivedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2WebMessageReceivedEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender, ICoreWebView2WebMessageReceivedEventArgs* args) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         if (!args) return S_OK;
 
         std::string message;
@@ -696,21 +864,25 @@ public:
 
         XBase::WebView::MessageHandler handler = nullptr;
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            handler = s_state.messageHandler;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            handler = ActiveState().messageHandler;
         }
         if (handler) {
             handler(message);
         }
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class NewWindowRequestedHandler final : public ICoreWebView2NewWindowRequestedEventHandler {
 public:
+    explicit NewWindowRequestedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2NewWindowRequestedEventHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         if (!sender || !args) return S_OK;
         args->put_Handled(TRUE);
         LPWSTR uri = nullptr;
@@ -720,20 +892,24 @@ public:
         }
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class ControllerCompletedHandler final : public ICoreWebView2CreateCoreWebView2ControllerCompletedHandler {
 public:
+    explicit ControllerCompletedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Controller* controller) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         bool ready = false;
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            s_state.createInFlight = false;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().createInFlight = false;
 
-            if (s_state.shutdownPending || !s_state.hostWindow || !IsWindow(s_state.hostWindow)) {
-                s_state.shutdownPending = false;
+            if (ActiveState().shutdownPending || !ActiveState().hostWindow || !IsWindow(ActiveState().hostWindow)) {
+                ActiveState().shutdownPending = false;
                 if (controller) {
                     controller->Close();
                 }
@@ -741,22 +917,22 @@ public:
             } else if (FAILED(errorCode) || !controller) {
                 XBase::Log::Error("WebView: WebView2 控制器创建失败");
             } else {
-                s_state.controller = controller;
-                s_state.controller->AddRef();
-                s_state.controller->put_IsVisible(FALSE);
+                ActiveState().controller = controller;
+                ActiveState().controller->AddRef();
+                ActiveState().controller->put_IsVisible(FALSE);
                 ApplyBoundsLocked();
                 ApplyZoomLocked();
 
-                auto* acceleratorKey = new AcceleratorKeyPressedHandler();
-                if (SUCCEEDED(s_state.controller->add_AcceleratorKeyPressed(
-                        acceleratorKey, &s_state.acceleratorKeyToken))) {
-                    s_state.acceleratorKeyRegistered = true;
+                auto* acceleratorKey = new AcceleratorKeyPressedHandler(state_);
+                if (SUCCEEDED(ActiveState().controller->add_AcceleratorKeyPressed(
+                        acceleratorKey, &ActiveState().acceleratorKeyToken))) {
+                    ActiveState().acceleratorKeyRegistered = true;
                 }
                 acceleratorKey->Release();
 
                 ICoreWebView2* webview = nullptr;
-                if (SUCCEEDED(s_state.controller->get_CoreWebView2(&webview)) && webview) {
-                    s_state.webview = webview;
+                if (SUCCEEDED(ActiveState().controller->get_CoreWebView2(&webview)) && webview) {
+                    ActiveState().webview = webview;
                     ICoreWebView2Settings* settings = nullptr;
                     if (SUCCEEDED(webview->get_Settings(&settings)) && settings) {
                         settings->put_IsStatusBarEnabled(FALSE);
@@ -764,50 +940,56 @@ public:
                         settings->Release();
                     }
 
-                    auto* navigationStarting = new NavigationStartingHandler();
-                    auto* navigationCompleted = new NavigationCompletedHandler();
-                    auto* titleChanged = new DocumentTitleChangedHandler();
-                    auto* newWindow = new NewWindowRequestedHandler();
-                    if (SUCCEEDED(webview->add_NavigationStarting(navigationStarting, &s_state.navigationStartingToken))
-                        && SUCCEEDED(webview->add_NavigationCompleted(navigationCompleted, &s_state.navigationCompletedToken))
-                        && SUCCEEDED(webview->add_DocumentTitleChanged(titleChanged, &s_state.documentTitleToken))
-                        && SUCCEEDED(webview->add_NewWindowRequested(newWindow, &s_state.newWindowToken))) {
-                        s_state.tokensRegistered = true;
+                    auto* navigationStarting = new NavigationStartingHandler(state_);
+                    auto* navigationCompleted = new NavigationCompletedHandler(state_);
+                    auto* titleChanged = new DocumentTitleChangedHandler(state_);
+                    auto* newWindow = new NewWindowRequestedHandler(state_);
+                    if (SUCCEEDED(webview->add_NavigationStarting(navigationStarting, &ActiveState().navigationStartingToken))
+                        && SUCCEEDED(webview->add_NavigationCompleted(navigationCompleted, &ActiveState().navigationCompletedToken))
+                        && SUCCEEDED(webview->add_DocumentTitleChanged(titleChanged, &ActiveState().documentTitleToken))
+                        && SUCCEEDED(webview->add_NewWindowRequested(newWindow, &ActiveState().newWindowToken))) {
+                        ActiveState().tokensRegistered = true;
                     }
                     navigationStarting->Release();
                     navigationCompleted->Release();
                     titleChanged->Release();
                     newWindow->Release();
 
-                    auto* webMessage = new WebMessageReceivedHandler();
-                    if (SUCCEEDED(webview->add_WebMessageReceived(webMessage, &s_state.webMessageToken))) {
-                        s_state.webMessageRegistered = true;
+                    auto* webMessage = new WebMessageReceivedHandler(state_);
+                    if (SUCCEEDED(webview->add_WebMessageReceived(webMessage, &ActiveState().webMessageToken))) {
+                        ActiveState().webMessageRegistered = true;
                     }
                     webMessage->Release();
 
                     // 页面脚本注入要等控制器就绪，这里把登记过的全部补上，不清空，
                     // 之后再重建控制器时还要用同一份清单
-                    for (const std::string& script : s_state.documentScripts) {
+                    for (const std::string& script : ActiveState().documentScripts) {
                         webview->AddScriptToExecuteOnDocumentCreated(WideFrom(script).c_str(), nullptr);
                     }
 
                     ApplyVirtualHostsLocked(webview);
 
-                    s_state.canGoBack = false;
-                    s_state.canGoForward = false;
-                    s_state.url = SourceOf(webview);
-                    s_state.title = TitleOf(webview);
+                    ActiveState().canGoBack = false;
+                    ActiveState().canGoForward = false;
+                    ActiveState().url = SourceOf(webview);
+                    ActiveState().title = TitleOf(webview);
 
-                    if (!s_state.pendingHtml.empty()) {
-                        webview->NavigateToString(WideFrom(s_state.pendingHtml).c_str());
-                        s_state.pendingHtml.clear();
-                    } else if (!s_state.pendingUrl.empty()) {
-                        webview->Navigate(WideFrom(s_state.pendingUrl).c_str());
-                        s_state.pendingUrl.clear();
+                    const std::string html = !ActiveState().pendingHtml.empty()
+                        ? ActiveState().pendingHtml
+                        : ActiveState().sourceHtml;
+                    const std::string url = !ActiveState().pendingUrl.empty()
+                        ? ActiveState().pendingUrl
+                        : ActiveState().sourceUrl;
+                    if (!html.empty()) {
+                        webview->NavigateToString(WideFrom(html).c_str());
+                        ActiveState().pendingHtml.clear();
+                    } else if (!url.empty()) {
+                        webview->Navigate(WideFrom(url).c_str());
+                        ActiveState().pendingUrl.clear();
                     }
                 }
-                s_state.initialized = true;
-                if (s_state.visible) {
+                ActiveState().initialized = true;
+                if (ActiveState().visible) {
                     ApplyVisibleLocked();
                 }
                 ready = true;
@@ -820,18 +1002,22 @@ public:
         NotifyStateChanged();
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 class EnvironmentCompletedHandler final : public ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
 public:
+    explicit EnvironmentCompletedHandler(WebViewState* state) : state_(state) {}
     XBASE_WEBVIEW_HANDLER_BODY(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)
 
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, ICoreWebView2Environment* environment) override {
+        ScopedState scope(state_, FindInstanceId(state_));
         if (FAILED(errorCode) || !environment) {
             {
-                std::lock_guard<std::mutex> lock(s_state.mutex);
-                s_state.createInFlight = false;
-                s_state.createRequested = false;
+                std::lock_guard<std::mutex> lock(ActiveState().mutex);
+                ActiveState().createInFlight = false;
+                ActiveState().createRequested = false;
             }
             XBase::Log::Error("WebView: WebView2 环境创建失败");
             NotifyStateChanged();
@@ -842,26 +1028,30 @@ public:
         HWND hostWindow = nullptr;
         bool cancelled = false;
         {
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            cancelled = s_state.shutdownPending || !s_state.createRequested;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            cancelled = ActiveState().shutdownPending || !ActiveState().createRequested;
             if (!cancelled) {
-                s_state.environment = environment;
-                s_state.environment->AddRef();
-                storedEnvironment = s_state.environment;
-                hostWindow = s_state.hostWindow;
+                ActiveState().environment = environment;
+                ActiveState().environment->AddRef();
+                storedEnvironment = ActiveState().environment;
+                hostWindow = ActiveState().hostWindow;
             }
         }
         if (cancelled) {
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().createInFlight = false;
+            ActiveState().createRequested = false;
+            ActiveState().shutdownPending = false;
             return S_OK;
         }
         if (!hostWindow || !IsWindow(hostWindow)) {
             XBase::Log::Error("WebView: 宿主窗口缺失，无法创建控制器");
-            std::lock_guard<std::mutex> lock(s_state.mutex);
-            s_state.createInFlight = false;
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().createInFlight = false;
             ReleaseControllerLocked();
             return S_OK;
         }
-        auto* handler = new ControllerCompletedHandler();
+        auto* handler = new ControllerCompletedHandler(state_);
         const HRESULT hr = storedEnvironment->CreateCoreWebView2Controller(hostWindow, handler);
         handler->Release();
         if (FAILED(hr)) {
@@ -869,11 +1059,13 @@ public:
         }
         return S_OK;
     }
+private:
+    WebViewState* state_;
 };
 
 bool EnsureHostWindow() {
-    if (s_state.hostWindow) return true;
-    if (!s_state.gameWindow) return false;
+    if (ActiveState().hostWindow) return true;
+    if (!ActiveState().gameWindow) return false;
 
     static bool classRegistered = false;
     if (!classRegistered) {
@@ -883,7 +1075,8 @@ bool EnsureHostWindow() {
         windowClass.lpfnWndProc = &HostWindowProc;
         windowClass.hInstance = GetModuleHandleW(nullptr);
         windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-        windowClass.lpszClassName = kHostWindowClass;
+        const std::wstring className = HostWindowClassName();
+        windowClass.lpszClassName = className.c_str();
         if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
             XBase::Log::Error("WebView: 宿主窗口类注册失败");
             return false;
@@ -891,25 +1084,55 @@ bool EnsureHostWindow() {
         classRegistered = true;
     }
 
-    s_state.hostWindow = CreateWindowExW(
-        0, kHostWindowClass, L"",
+    ActiveState().hostWindow = CreateWindowExW(
+        0, HostWindowClassName().c_str(), L"",
         WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
         0, 0, 1, 1,
-        s_state.gameWindow, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!s_state.hostWindow) {
+        ActiveState().gameWindow, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!ActiveState().hostWindow) {
         XBase::Log::Error("WebView: 宿主窗口创建失败");
         return false;
     }
+    SetPropW(ActiveState().hostWindow, kHostWindowMarker, reinterpret_cast<HANDLE>(1));
+    s_hostStates[ActiveState().hostWindow] = &ActiveState();
     return true;
 }
 
 void DestroyHostWindow() {
-    if (!s_state.hostWindow) return;
-    DestroyWindow(s_state.hostWindow);
-    s_state.hostWindow = nullptr;
+    if (!ActiveState().hostWindow) return;
+    RemovePropW(ActiveState().hostWindow, kHostWindowMarker);
+    s_hostStates.erase(ActiveState().hostWindow);
+    DestroyWindow(ActiveState().hostWindow);
+    ActiveState().hostWindow = nullptr;
 }
 
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    WebViewState* windowState = nullptr;
+    const auto stateIt = s_hostStates.find(window);
+    if (stateIt != s_hostStates.end()) {
+        windowState = stateIt->second;
+    }
+    ScopedState scope(windowState, windowState ? FindInstanceId(windowState) : XBase::WebView::DefaultInstance);
+    if (message == HostCloseMessage()) {
+        if (windowState) {
+            XBase::Log::Info("WebView: 收到新视图请求，关闭当前跨模块宿主");
+            // 旧模块的 ReactUi 会在下一帧按菜单状态自动重显；
+            // 关闭宿主时同步收起它，避免与新面板互相抢占。
+            XBase::Hooks::SetBackgroundInputActive(false);
+            XBase::Hooks::SetBackgroundRenderActive(false);
+            XBase::Hooks::SetMenuVisible(false);
+            std::lock_guard<std::mutex> lock(ActiveState().mutex);
+            ActiveState().visible = false;
+            ActiveState().createRequested = false;
+            if (ActiveState().createInFlight) {
+                ActiveState().shutdownPending = true;
+                ApplyVisibleLocked();
+            } else {
+                ReleaseControllerLocked();
+            }
+        }
+        return 0;
+    }
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -923,9 +1146,9 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         XBase::Detail::Input::HandleVirtualKey(static_cast<std::uint32_t>(wParam), false, false);
         break;
     case WM_SIZE:
-        if (s_state.controller) {
+        if (ActiveState().controller) {
             RECT bounds{0, 0, LOWORD(lParam), HIWORD(lParam)};
-            s_state.controller->put_Bounds(bounds);
+            ActiveState().controller->put_Bounds(bounds);
         }
         return 0;
     case WM_CLOSE:
@@ -942,13 +1165,41 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
 namespace XBase::WebView {
 
-bool IsRuntimeAvailable() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (s_state.runtimeState >= 0) {
-        return s_state.runtimeState == 1;
+WebViewId Create() {
+    const WebViewId id = s_nextInstanceId++;
+    s_instances.emplace(id, std::make_unique<WebViewState>());
+    return id;
+}
+
+void Destroy(WebViewId id) {
+    if (id == DefaultInstance) {
+        Shutdown(id);
+        return;
+    }
+    auto found = s_instances.find(id);
+    if (found == s_instances.end()) return;
+    {
+        ScopedState scope(found->second.get(), id);
+        Shutdown(id);
+    }
+    // 异步环境/控制器回调可能仍然持有状态指针，保留槽位直到进程退出，
+    // 避免销毁实例后回调访问悬空内存。后续创建会使用新的 ID。
+}
+
+WebViewId CurrentInstance() {
+    return ActiveInstance();
+}
+
+bool IsRuntimeAvailable(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (ActiveState().runtimeState >= 0) {
+        return ActiveState().runtimeState == 1;
     }
     if (!LoadRuntime()) {
-        s_state.runtimeState = 0;
+        ActiveState().runtimeState = 0;
         return false;
     }
     LPWSTR version = nullptr;
@@ -956,28 +1207,51 @@ bool IsRuntimeAvailable() {
     if (version) {
         CoTaskMemFree(version);
     }
-    s_state.runtimeState = SUCCEEDED(hr) ? 1 : 0;
-    return s_state.runtimeState == 1;
+    ActiveState().runtimeState = SUCCEEDED(hr) ? 1 : 0;
+    return ActiveState().runtimeState == 1;
 }
 
-bool Init() {
+bool IsRuntimeAvailable() {
+    return IsRuntimeAvailable(ActiveInstance());
+}
+
+bool Init(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
     // 只登记请求。真正的创建延迟到宿主请求页面后的 Process 安全点执行，
     // 避免在渲染钩子里重入消息循环，也避免未使用网页时启动源码进程。
     if (!IsRuntimeAvailable()) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.initRequested = true;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().initRequested = true;
     return true;
 }
 
+bool Init() {
+    return Init(ActiveInstance());
+}
+
+bool IsInitialized(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    return ActiveState().initRequested || ActiveState().initialized;
+}
+
 bool IsInitialized() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    return s_state.initRequested || s_state.initialized;
+    return IsInitialized(ActiveInstance());
 }
 
 void NotifyGameInit() {
-    SetVisible(false);
+    SetVisible(DefaultInstance, false);
+    std::vector<WebViewId> ids;
+    for (const auto& entry : s_instances) ids.push_back(entry.first);
+    for (const WebViewId id : ids) {
+        SetVisible(id, false);
+    }
 }
 
 void ProcessCreation();
@@ -988,12 +1262,12 @@ void ProcessMenuTransition() {
 
     bool shouldHide = false;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
         if (menuVisible) {
-            s_state.menuWasVisible = true;
-        } else if (s_state.menuWasVisible) {
-            s_state.menuWasVisible = false;
-            shouldHide = s_state.visible;
+            ActiveState().menuWasVisible = true;
+        } else if (ActiveState().menuWasVisible) {
+            ActiveState().menuWasVisible = false;
+            shouldHide = ActiveState().visible;
         }
     }
     if (shouldHide) {
@@ -1009,26 +1283,26 @@ void ProcessCapture() {
     bool wantCapture = false;
     bool modeChanged = false;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        if (s_state.lastModeCheckAt == 0 || now - s_state.lastModeCheckAt >= kCaptureModeCheckMs) {
-            s_state.lastModeCheckAt = now;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        if (ActiveState().lastModeCheckAt == 0 || now - ActiveState().lastModeCheckAt >= kCaptureModeCheckMs) {
+            ActiveState().lastModeCheckAt = now;
             const bool exclusive = IsExclusiveFullscreen();
-            if (exclusive != s_state.captureMode) {
-                s_state.captureMode = exclusive;
+            if (exclusive != ActiveState().captureMode) {
+                ActiveState().captureMode = exclusive;
                 modeChanged = true;
             }
         }
-        if (s_state.captureMode && s_state.initialized && s_state.visible && !s_state.captureInFlight) {
+        if (ActiveState().captureMode && ActiveState().initialized && ActiveState().visible && !ActiveState().captureInFlight) {
             // 菜单开着就按交互期算，否则用户停下来看面板，画面就停在几秒前的样子
             const bool active = menuVisible
-                || now - s_state.lastInteractionAt < kCaptureActiveWindowMs;
-            s_state.captureActive = active;
+                || now - ActiveState().lastInteractionAt < kCaptureActiveWindowMs;
+            ActiveState().captureActive = active;
             const unsigned long long interval = active ? kCaptureActiveIntervalMs : kCaptureIdleIntervalMs;
-            wantCapture = s_state.lastCaptureAt == 0 || now - s_state.lastCaptureAt >= interval;
+            wantCapture = ActiveState().lastCaptureAt == 0 || now - ActiveState().lastCaptureAt >= interval;
         }
-        if (modeChanged && s_state.hostWindow && s_state.gameWindow) {
+        if (modeChanged && ActiveState().hostWindow && ActiveState().gameWindow) {
             // 抓帧模式改变渲染表面大小，重新应用一次边界
-            s_state.boundsApplied = false;
+            ActiveState().boundsApplied = false;
             ApplyBoundsLocked();
         }
     }
@@ -1040,8 +1314,8 @@ void ProcessCapture() {
 // 面板获得焦点期间按键只到达网页子窗口，用系统状态补齐输入，保证菜单热键仍可关闭菜单
 void ProcessKeyboardFallback() {
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        if (!s_state.initialized || !s_state.visible) return;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        if (!ActiveState().initialized || !ActiveState().visible) return;
     }
     XBase::Detail::Input::PollFromSystem();
 }
@@ -1052,16 +1326,16 @@ void ProcessCursorVisibility() {
     bool panelShown = false;
     HWND hostWindow = nullptr;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        panelShown = s_state.initialized && s_state.visible && !s_state.captureMode;
-        hostWindow = s_state.hostWindow;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        panelShown = ActiveState().initialized && ActiveState().visible && !ActiveState().captureMode;
+        hostWindow = ActiveState().hostWindow;
     }
 
     if (panelShown) {
         CURSORINFO info{};
         info.cbSize = sizeof(info);
         if (GetCursorInfo(&info) && info.flags == 0 && ShowCursor(TRUE) >= 0) {
-            ++s_state.cursorShows;
+            ++ActiveState().cursorShows;
         }
 
         // 游戏在游玩状态会把光标形状设成空，落在面板上时补回箭头形状，
@@ -1083,11 +1357,11 @@ void ProcessCursorVisibility() {
         return;
     }
 
-    if (s_state.cursorShows > 0) {
-        for (int index = 0; index < s_state.cursorShows; ++index) {
+    if (ActiveState().cursorShows > 0) {
+        for (int index = 0; index < ActiveState().cursorShows; ++index) {
             ShowCursor(FALSE);
         }
-        s_state.cursorShows = 0;
+        ActiveState().cursorShows = 0;
     }
 }
 
@@ -1097,16 +1371,31 @@ void Process() {
     ProcessCapture();
     ProcessKeyboardFallback();
     ProcessCursorVisibility();
+
+    std::vector<WebViewId> ids;
+    ids.reserve(s_instances.size());
+    for (const auto& entry : s_instances) ids.push_back(entry.first);
+    for (const WebViewId id : ids) {
+        WebViewState* state = FindState(id);
+        if (!state) continue;
+        ScopedState scope(state, id);
+        ProcessMenuTransition();
+        ProcessCreation();
+        ProcessCapture();
+        ProcessKeyboardFallback();
+        ProcessCursorVisibility();
+    }
 }
 
 void ProcessCreation() {
-    if (!s_state.createRequested || s_state.initialized || s_state.createInFlight
-        || s_state.shutdownPending) {
+    if (!ActiveState().createRequested || ActiveState().initialized || ActiveState().createInFlight
+        || ActiveState().shutdownPending) {
         return;
     }
 
     const HWND gameWindow = Detail::Hooks::GetGameWindow();
-    if (!gameWindow) {
+    const HWND fallbackWindow = gameWindow ? gameWindow : GetForegroundWindow();
+    if (!fallbackWindow) {
         return;
     }
 
@@ -1117,13 +1406,13 @@ void ProcessCreation() {
     }
 
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        if (!s_state.createRequested || s_state.initialized || s_state.createInFlight) {
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        if (!ActiveState().createRequested || ActiveState().initialized || ActiveState().createInFlight) {
             return;
         }
-        s_state.gameWindow = gameWindow;
+        ActiveState().gameWindow = fallbackWindow;
         if (!EnsureHostWindow()) {
-            s_state.createRequested = false;
+            ActiveState().createRequested = false;
             Log::Error("WebView: 宿主窗口创建失败");
             return;
         }
@@ -1135,11 +1424,15 @@ void ProcessCreation() {
     if (!dataFolder.empty()) {
         // EnsureDirectory 只建最后一级，先把 com.yuinijika.xbase 建出来
         Platform::EnsureDirectory(dataFolder);
-        dataFolder += "webview2";
+        const std::string sharedFolder = dataFolder + "webview2\\";
+        Platform::EnsureDirectory(sharedFolder);
+        dataFolder = sharedFolder + "instance_" + std::to_string(ActiveInstance());
     }
     if (dataFolder.empty() || !Platform::EnsureDirectory(dataFolder)) {
         // AppData 不可用时退回游戏目录，至少保证网页视图可用
-        dataFolder = XBase::Platform::XBaseDirectory() + "webview2";
+        const std::string sharedFolder = XBase::Platform::XBaseDirectory() + "webview2\\";
+        Platform::EnsureDirectory(sharedFolder);
+        dataFolder = sharedFolder + "instance_" + std::to_string(ActiveInstance());
         Platform::EnsureDirectory(dataFolder);
     }
 
@@ -1152,7 +1445,7 @@ void ProcessCreation() {
         }
     }
 
-    auto* handler = new EnvironmentCompletedHandler();
+    auto* handler = new EnvironmentCompletedHandler(&ActiveState());
     const HRESULT hr = s_runtime.createEnvironment(
         nullptr,
         WideFrom(dataFolder).c_str(),
@@ -1160,13 +1453,13 @@ void ProcessCreation() {
         handler);
     handler->Release();
 
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     if (FAILED(hr)) {
-        s_state.createRequested = false;
+        ActiveState().createRequested = false;
         Log::Error("WebView: WebView2 环境创建请求失败");
         return;
     }
-    s_state.createInFlight = true;
+    ActiveState().createInFlight = true;
 }
 
 // 关闭面板会释放浏览器与宿主窗口，之后再次设为可见会重新创建
@@ -1175,11 +1468,11 @@ bool Close() {
 
     SetVisible(false);
 
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.initRequested = true;
-    s_state.createRequested = false;
-    if (s_state.createInFlight) {
-        s_state.shutdownPending = true;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().initRequested = true;
+    ActiveState().createRequested = false;
+    if (ActiveState().createInFlight) {
+        ActiveState().shutdownPending = true;
         return true;
     }
     ReleaseControllerLocked();
@@ -1187,14 +1480,23 @@ bool Close() {
 }
 
 void Shutdown() {
+    if (!t_activeState) {
+        Shutdown(DefaultInstance);
+        std::vector<WebViewId> ids;
+        for (const auto& entry : s_instances) ids.push_back(entry.first);
+        for (const WebViewId id : ids) {
+            Shutdown(id);
+        }
+        return;
+    }
     SetVisible(false);
 
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.initRequested = false;
-    s_state.createRequested = false;
-    if (s_state.createInFlight) {
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().initRequested = false;
+    ActiveState().createRequested = false;
+    if (ActiveState().createInFlight) {
         // 创建中的控制器到达后自行释放并销毁窗口，避免父窗口句柄被复用
-        s_state.shutdownPending = true;
+        ActiveState().shutdownPending = true;
         return;
     }
     ReleaseControllerLocked();
@@ -1203,72 +1505,81 @@ void Shutdown() {
 bool Navigate(const std::string& url) {
     if (url.empty()) return false;
     if (!IsRuntimeAvailable()) return false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.initRequested = true;
-    s_state.createRequested = true;
-    if (!s_state.webview) {
-        s_state.pendingUrl = url;
-        s_state.pendingHtml.clear();
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().initRequested = true;
+    ActiveState().createRequested = true;
+    ActiveState().sourceUrl = url;
+    ActiveState().sourceHtml.clear();
+    if (!ActiveState().webview) {
+        ActiveState().pendingUrl = url;
+        ActiveState().pendingHtml.clear();
         return true;
     }
-    return SUCCEEDED(s_state.webview->Navigate(WideFrom(url).c_str()));
+    return SUCCEEDED(ActiveState().webview->Navigate(WideFrom(url).c_str()));
 }
 
 bool SetHtml(const std::string& html) {
     if (html.empty()) return false;
     if (!IsRuntimeAvailable()) return false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.initRequested = true;
-    s_state.createRequested = true;
-    if (!s_state.webview) {
-        s_state.pendingHtml = html;
-        s_state.pendingUrl.clear();
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().initRequested = true;
+    ActiveState().createRequested = true;
+    ActiveState().sourceHtml = html;
+    ActiveState().sourceUrl.clear();
+    if (!ActiveState().webview) {
+        ActiveState().pendingHtml = html;
+        ActiveState().pendingUrl.clear();
         return true;
     }
-    return SUCCEEDED(s_state.webview->NavigateToString(WideFrom(html).c_str()));
+    return SUCCEEDED(ActiveState().webview->NavigateToString(WideFrom(html).c_str()));
 }
 
 void Reload() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (s_state.webview) {
-        s_state.webview->Reload();
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (ActiveState().webview) {
+        ActiveState().webview->Reload();
     }
 }
 
 bool GoBack() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (!s_state.webview || !s_state.canGoBack) return false;
-    return SUCCEEDED(s_state.webview->GoBack());
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (!ActiveState().webview || !ActiveState().canGoBack) return false;
+    return SUCCEEDED(ActiveState().webview->GoBack());
 }
 
 bool GoForward() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (!s_state.webview || !s_state.canGoForward) return false;
-    return SUCCEEDED(s_state.webview->GoForward());
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (!ActiveState().webview || !ActiveState().canGoForward) return false;
+    return SUCCEEDED(ActiveState().webview->GoForward());
 }
 
 void SetZoom(float factor) {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     if (factor < 0.25f) factor = 0.25f;
     if (factor > 4.0f) factor = 4.0f;
-    s_state.zoom = factor;
+    ActiveState().zoom = factor;
     ApplyZoomLocked();
 }
 
 void SetVisible(bool visible) {
+    const XBase::WebView::WebViewId currentId = ActiveInstance();
+    if (visible) {
+        CloseOtherInstances(currentId);
+    }
+
     // 显示面板即视为请求懒创建，创建在 Process 的安全点执行
     const bool runtimeAvailable = visible ? IsRuntimeAvailable() : false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (s_state.visible == visible) return;
-    s_state.visible = visible;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (ActiveState().visible == visible) return;
+    ActiveState().visible = visible;
     if (visible) {
         if (!runtimeAvailable) {
-            s_state.visible = false;
+            ActiveState().visible = false;
             return;
         }
-        s_state.initRequested = true;
-        s_state.createRequested = true;
-        if (!s_state.boundsApplied) {
+        ActiveState().initRequested = true;
+        ActiveState().createRequested = true;
+        if (!ActiveState().boundsApplied) {
             ApplyBoundsLocked();
         }
     }
@@ -1276,53 +1587,53 @@ void SetVisible(bool visible) {
 }
 
 bool IsVisible() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    return s_state.visible;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    return ActiveState().visible;
 }
 
 void SetBounds(const Rect& bounds) {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (s_state.boundsApplied
-        && s_state.bounds.left == bounds.left
-        && s_state.bounds.top == bounds.top
-        && s_state.bounds.right == bounds.right
-        && s_state.bounds.bottom == bounds.bottom) {
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (ActiveState().boundsApplied
+        && ActiveState().bounds.left == bounds.left
+        && ActiveState().bounds.top == bounds.top
+        && ActiveState().bounds.right == bounds.right
+        && ActiveState().bounds.bottom == bounds.bottom) {
         return;
     }
-    s_state.bounds = bounds;
+    ActiveState().bounds = bounds;
     ApplyBoundsLocked();
 }
 
 State GetState() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     State state;
-    state.initialized = s_state.initialized;
-    state.visible = s_state.visible;
-    state.loading = s_state.loading;
-    state.canGoBack = s_state.canGoBack;
-    state.canGoForward = s_state.canGoForward;
-    state.lastError = s_state.lastError;
-    state.url = s_state.url;
-    state.title = s_state.title;
+    state.initialized = ActiveState().initialized;
+    state.visible = ActiveState().visible;
+    state.loading = ActiveState().loading;
+    state.canGoBack = ActiveState().canGoBack;
+    state.canGoForward = ActiveState().canGoForward;
+    state.lastError = ActiveState().lastError;
+    state.url = ActiveState().url;
+    state.title = ActiveState().title;
     return state;
 }
 
 void SetStateCallback(StateCallback callback) {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.stateCallback = callback;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().stateCallback = callback;
 }
 
 void SetMessageHandler(MessageHandler handler) {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    s_state.messageHandler = std::move(handler);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    ActiveState().messageHandler = std::move(handler);
 }
 
 bool MapFolder(const std::string& hostName, const std::string& folderPath) {
     if (hostName.empty() || folderPath.empty()) return false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
 
     bool replaced = false;
-    for (auto& entry : s_state.virtualHosts) {
+    for (auto& entry : ActiveState().virtualHosts) {
         if (entry.first == hostName) {
             entry.second = folderPath;
             replaced = true;
@@ -1330,36 +1641,36 @@ bool MapFolder(const std::string& hostName, const std::string& folderPath) {
         }
     }
     if (!replaced) {
-        s_state.virtualHosts.emplace_back(hostName, folderPath);
+        ActiveState().virtualHosts.emplace_back(hostName, folderPath);
     }
 
-    if (s_state.webview) {
-        ApplyVirtualHostsLocked(s_state.webview);
+    if (ActiveState().webview) {
+        ApplyVirtualHostsLocked(ActiveState().webview);
     }
     return true;
 }
 
 bool PostJson(const std::string& json) {
     if (json.empty()) return false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    if (!s_state.webview) return false;
-    return SUCCEEDED(s_state.webview->PostWebMessageAsJson(WideFrom(json).c_str()));
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    if (!ActiveState().webview) return false;
+    return SUCCEEDED(ActiveState().webview->PostWebMessageAsJson(WideFrom(json).c_str()));
 }
 
 bool InjectScript(const std::string& script) {
     if (script.empty()) return false;
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     // 先进持久清单，之后无论控制器重建多少次都会重新注入
-    s_state.documentScripts.push_back(script);
-    if (!s_state.webview) {
+    ActiveState().documentScripts.push_back(script);
+    if (!ActiveState().webview) {
         return true;
     }
-    return SUCCEEDED(s_state.webview->AddScriptToExecuteOnDocumentCreated(WideFrom(script).c_str(), nullptr));
+    return SUCCEEDED(ActiveState().webview->AddScriptToExecuteOnDocumentCreated(WideFrom(script).c_str(), nullptr));
 }
 
 bool UsesCaptureMode() {
-    std::lock_guard<std::mutex> lock(s_state.mutex);
-    return s_state.initialized && s_state.captureMode;
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
+    return ActiveState().initialized && ActiveState().captureMode;
 }
 
 void DrawPanel(const Rect& bounds) {
@@ -1367,10 +1678,10 @@ void DrawPanel(const Rect& bounds) {
     const float height = bounds.bottom - bounds.top;
     if (width <= 0.0f || height <= 0.0f) return;
 
-    std::lock_guard<std::mutex> lock(s_state.mutex);
+    std::lock_guard<std::mutex> lock(ActiveState().mutex);
     ImGui::SetCursorScreenPos(ImVec2(bounds.left, bounds.top));
-    if (s_state.texture && s_state.previewReady) {
-        ImGui::Image(reinterpret_cast<ImTextureID>(s_state.texture), ImVec2(width, height));
+    if (ActiveState().texture && ActiveState().previewReady) {
+        ImGui::Image(reinterpret_cast<ImTextureID>(ActiveState().texture), ImVec2(width, height));
         return;
     }
 
@@ -1390,28 +1701,28 @@ void ForwardPanelInput(const Rect& bounds, Vec2 mouse, bool mouseDown, float whe
     int pageWidth = 0;
     int pageHeight = 0;
     {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        pageWidth = s_state.textureWidth;
-        pageHeight = s_state.textureHeight;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        pageWidth = ActiveState().textureWidth;
+        pageHeight = ActiveState().textureHeight;
     }
     if (pageWidth <= 0 || pageHeight <= 0) return;
 
     const float x = std::clamp((mouse.x - bounds.left) * pageWidth / width, 0.0f, pageWidth - 1.0f);
     const float y = std::clamp((mouse.y - bounds.top) * pageHeight / height, 0.0f, pageHeight - 1.0f);
 
-    const bool clickEdge = mouseDown && !s_state.previousMouseDown;
-    s_state.previousMouseDown = mouseDown;
+    const bool clickEdge = mouseDown && !ActiveState().previousMouseDown;
+    ActiveState().previousMouseDown = mouseDown;
 
     const unsigned long long now = static_cast<unsigned long long>(Platform::MonotonicMilliseconds());
-    const bool movedEnough = !s_state.forwardedMoveValid
-        || std::abs(x - s_state.lastForwardedMoveX) >= kInteractionMoveThreshold
-        || std::abs(y - s_state.lastForwardedMoveY) >= kInteractionMoveThreshold;
-    const bool moved = movedEnough && now - s_state.lastForwardedMoveAt >= kMoveForwardIntervalMs;
+    const bool movedEnough = !ActiveState().forwardedMoveValid
+        || std::abs(x - ActiveState().lastForwardedMoveX) >= kInteractionMoveThreshold
+        || std::abs(y - ActiveState().lastForwardedMoveY) >= kInteractionMoveThreshold;
+    const bool moved = movedEnough && now - ActiveState().lastForwardedMoveAt >= kMoveForwardIntervalMs;
     if (moved) {
-        s_state.lastForwardedMoveX = x;
-        s_state.lastForwardedMoveY = y;
-        s_state.lastForwardedMoveAt = now;
-        s_state.forwardedMoveValid = true;
+        ActiveState().lastForwardedMoveX = x;
+        ActiveState().lastForwardedMoveY = y;
+        ActiveState().lastForwardedMoveAt = now;
+        ActiveState().forwardedMoveValid = true;
         char script[512]{};
         std::snprintf(script, sizeof(script),
             "(function(){var e=document.elementFromPoint(%.1f,%.1f);if(!e)return;"
@@ -1439,12 +1750,152 @@ void ForwardPanelInput(const Rect& bounds, Vec2 mouse, bool mouseDown, float whe
     }
 
     if (moved || clickEdge || wheelDelta != 0.0f) {
-        std::lock_guard<std::mutex> lock(s_state.mutex);
-        s_state.lastInteractionAt = now;
+        std::lock_guard<std::mutex> lock(ActiveState().mutex);
+        ActiveState().lastInteractionAt = now;
         if (clickEdge || wheelDelta != 0.0f) {
-            s_state.lastCaptureAt = 0;
+            ActiveState().lastCaptureAt = 0;
         }
     }
+}
+
+bool Close(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return Close();
+}
+
+void Shutdown(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    Shutdown();
+}
+
+bool Navigate(WebViewId id, const std::string& url) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return Navigate(url);
+}
+
+bool SetHtml(WebViewId id, const std::string& html) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return SetHtml(html);
+}
+
+void Reload(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    Reload();
+}
+
+bool GoBack(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return GoBack();
+}
+
+bool GoForward(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return GoForward();
+}
+
+void SetZoom(WebViewId id, float factor) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    SetZoom(factor);
+}
+
+void SetVisible(WebViewId id, bool visible) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    SetVisible(visible);
+}
+
+bool IsVisible(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return IsVisible();
+}
+
+void SetBounds(WebViewId id, const Rect& bounds) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    SetBounds(bounds);
+}
+
+State GetState(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return {};
+    ScopedState scope(state, id);
+    return GetState();
+}
+
+void SetStateCallback(WebViewId id, StateCallback callback) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    SetStateCallback(callback);
+}
+
+void SetMessageHandler(WebViewId id, MessageHandler handler) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    SetMessageHandler(std::move(handler));
+}
+
+bool PostJson(WebViewId id, const std::string& json) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return PostJson(json);
+}
+
+bool InjectScript(WebViewId id, const std::string& script) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return InjectScript(script);
+}
+
+bool MapFolder(WebViewId id, const std::string& hostName, const std::string& folderPath) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return MapFolder(hostName, folderPath);
+}
+
+bool UsesCaptureMode(WebViewId id) {
+    WebViewState* state = FindState(id);
+    if (!state) return false;
+    ScopedState scope(state, id);
+    return UsesCaptureMode();
+}
+
+void DrawPanel(WebViewId id, const Rect& bounds) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    DrawPanel(bounds);
+}
+
+void ForwardPanelInput(WebViewId id, const Rect& bounds, Vec2 mouse, bool mouseDown, float wheelDelta) {
+    WebViewState* state = FindState(id);
+    if (!state) return;
+    ScopedState scope(state, id);
+    ForwardPanelInput(bounds, mouse, mouseDown, wheelDelta);
 }
 
 } // namespace XBase::WebView

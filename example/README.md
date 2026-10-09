@@ -102,6 +102,20 @@ XBase::Panel::BindValue(
 
 控件 `id` 全局唯一，约定按 `模组名.分区.项` 起名。`Control` 上的 `capability` 填 `FeatureCapability`，能力不支持时控件置灰而不是消失；`games` 限定版本；`visibleWhen` 让控件依赖同分区另一个控件，前置 `!` 取反。
 
+### Custom 控件资源
+
+`ControlKind::Custom` 同时支持内联 HTML / JavaScript / CSS 与独立文件，二者可以按字段混用。独立文件路径相对于 `XBase\Mods\<modId>\`：
+
+```cpp
+custom.htmlFile = "ui/custom.html";
+custom.scriptFile = "ui/custom.js";
+custom.styleFile = "ui/custom.css";
+```
+
+构建脚本会自动把示例的 `ui/` 目录复制到模组数据目录。运行时优先读取文件；文件缺失或读取失败时保留对应的 `html`、`script`、`style` 内联内容。路径不能是绝对路径，也不能包含 `..`。
+
+`04-panel` 的桥接 API 示例使用 `ui/bridge.html`、`ui/bridge.js` 与 `ui/bridge.css`，同时保留了相同的 Custom 控件 API 调用方式。
+
 ## 模组清单 package.json
 
 每个示例都带 `data/package.json`，构建时落到 `build\bin\XBase\Mods\<模组名>\package.json`。Bootstrap 在挂载模组**之前**读它做约束校验，不满足就拒绝挂载并弹出原因，所以清单不是可选装饰。

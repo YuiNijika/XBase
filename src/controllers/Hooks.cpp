@@ -15,6 +15,7 @@
 #include <Windows.h>
 #include <d3d9.h>
 #include "kiero/kiero.h"
+#include "kiero/minhook/MinHook.h"
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_win32.h"
 #include "imgui/imgui_impl_dx9.h"
@@ -22,6 +23,7 @@
 #include "CPad.h"
 #include "InputInternal.h"
 #include "RenderFonts.h"
+#include "../backends/TargetingBackend.h"
 
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -44,11 +46,19 @@ bool g_backgroundInputActive = false;
 bool g_backgroundRenderActive = false;
 float g_wheelDelta = 0.0f;
 std::atomic<bool> g_wheelSuppressed{false};
+std::atomic<bool> g_middleSuppressed{false};
 const char* g_statusText = "not initialized";
 HWND g_window = nullptr;
 WNDPROC g_originalWndProc = nullptr;
 EndSceneFn g_originalEndScene = nullptr;
 ResetFn g_originalReset = nullptr;
+#if defined(GTAVC)
+using UpdateMouseFn = void(__cdecl*)();
+#else
+using UpdateMouseFn = void(__thiscall*)(CPad*);
+#endif
+UpdateMouseFn g_originalUpdateMouse = nullptr;
+void* g_updateMouseTarget = nullptr;
 bool g_gameInputBlocked = false;
 std::array<bool, 256> g_keysHeldBeforeBlock{};
 IDirect3DDevice9* g_device = nullptr;
@@ -224,6 +234,49 @@ void ClearMouseState() {
     CPad::OldMouseControllerState = {};
     CPad::PCTempMouseControllerState = {};
     (void)pad;
+}
+
+void FilterMouseInput() {
+    if (!g_middleSuppressed.load(std::memory_order_acquire)) return;
+    CPad::NewMouseControllerState.mmb = 0;
+    CPad::OldMouseControllerState.mmb = 0;
+    CPad::PCTempMouseControllerState.mmb = 0;
+    XBase::Detail::TargetingBackend::UpdatePointerInput();
+}
+
+#if defined(GTAVC)
+void __cdecl UpdateMouse() {
+    RenderCallbackScope callbackScope;
+    g_originalUpdateMouse();
+    if (callbackScope) FilterMouseInput();
+}
+#else
+void __fastcall UpdateMouse(CPad* pad, void*) {
+    RenderCallbackScope callbackScope;
+    g_originalUpdateMouse(pad);
+    if (callbackScope) FilterMouseInput();
+}
+#endif
+
+bool InstallMouseInputHook() {
+#if defined(GTAVC)
+    g_updateMouseTarget = reinterpret_cast<void*>(gaddrof(CPad::UpdateMouse));
+#elif defined(GTASA)
+    g_updateMouseTarget = reinterpret_cast<void*>(0x53F3C0);
+#elif defined(GTA3)
+    g_updateMouseTarget = reinterpret_cast<void*>(0x491CA0);
+#endif
+    if (!g_updateMouseTarget) return false;
+    if (MH_CreateHook(g_updateMouseTarget, reinterpret_cast<void*>(&UpdateMouse),
+            reinterpret_cast<void**>(&g_originalUpdateMouse)) != MH_OK) {
+        g_updateMouseTarget = nullptr;
+        return false;
+    }
+    if (MH_EnableHook(g_updateMouseTarget) == MH_OK) return true;
+    MH_RemoveHook(g_updateMouseTarget);
+    g_updateMouseTarget = nullptr;
+    g_originalUpdateMouse = nullptr;
+    return false;
 }
 
 // 菜单期间按下的键若在关闭瞬间仍未松开，游戏恢复输入的第一帧会把它当作菜单操作
@@ -976,6 +1029,12 @@ LRESULT __stdcall WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lPara
         XBase::Detail::Input::HandleVirtualKey(static_cast<std::uint32_t>(wParam), false, false);
     }
 
+    if (g_middleSuppressed.load(std::memory_order_acquire)
+        && (message == WM_MBUTTONDOWN || message == WM_MBUTTONUP
+            || message == WM_MBUTTONDBLCLK)) {
+        return 1;
+    }
+
     if (WantsInput() && ImGui::GetCurrentContext()) {
         ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
         const ImGuiIO& io = ImGui::GetIO();
@@ -1175,6 +1234,16 @@ bool Init() {
         return false;
     }
 
+    if (!InstallMouseInputHook()) {
+        kiero::shutdown();
+        g_originalEndScene = nullptr;
+        g_originalReset = nullptr;
+        g_state = RuntimeState::Failed;
+        g_statusText = "mouse input hook failed";
+        Log::Error("Hooks: mouse input hook failed");
+        return false;
+    }
+
     g_state = RuntimeState::Hooked;
     g_statusText = "D3D9 hook installed";
     Log::Info("Hooks: D3D9 hooks installed");
@@ -1209,6 +1278,11 @@ void Shutdown() {
     }
     kiero::shutdown();
     WaitForRenderCallbacks();
+    if (g_updateMouseTarget) {
+        MH_RemoveHook(g_updateMouseTarget);
+        g_updateMouseTarget = nullptr;
+        g_originalUpdateMouse = nullptr;
+    }
 
     if (previousState == RuntimeState::RenderReady) {
         ReleaseCursor();
@@ -1230,6 +1304,7 @@ void Shutdown() {
     g_device = nullptr;
     g_wheelDelta = 0.0f;
     g_wheelSuppressed.store(false, std::memory_order_release);
+    g_middleSuppressed.store(false, std::memory_order_release);
     XBase::Detail::Input::Reset();
     g_statusText = "not initialized";
     g_state = RuntimeState::Uninitialized;
@@ -1305,8 +1380,15 @@ void SetMenuVisible(bool visible) {
 #if defined(XBASE_WITH_KIERO)
     if (!IsInitialized()) visible = false;
     g_menuVisible = visible;
-    ApplyGameInputBlock(WantsInput());
-    if (!WantsInput()) ReleaseCursor();
+    if (WantsInput()) {
+        ApplyGameInputBlock(true);
+    } else {
+        // 关闭菜单时必须立即恢复游戏输入。跨模块切换或网页宿主失焦时，
+        // 关闭瞬间按键仍可能保持按下；释放保护不能把 DisablePlayerControls
+        // 或 DirectInput 补丁留在锁定状态，否则游戏鼠标会一直失灵。
+        ApplyGameInputBlock(false, false);
+        ReleaseCursor();
+    }
 #else
     (void)visible;
 #endif
@@ -1327,8 +1409,12 @@ void ToggleMenu() {
 void SetBackgroundInputActive(bool active) {
 #if defined(XBASE_WITH_KIERO)
     g_backgroundInputActive = active;
-    ApplyGameInputBlock(WantsInput());
-    if (!WantsInput()) ReleaseCursor();
+    if (WantsInput()) {
+        ApplyGameInputBlock(true);
+    } else {
+        ApplyGameInputBlock(false, false);
+        ReleaseCursor();
+    }
 #else
     (void)active;
 #endif
@@ -1399,6 +1485,14 @@ float ConsumeWheelDelta() {
 
 void SetWheelInputSuppressed(bool suppressed) {
     g_wheelSuppressed.store(suppressed, std::memory_order_release);
+}
+
+void SetMiddleInputSuppressed(bool suppressed) {
+    g_middleSuppressed.store(suppressed, std::memory_order_release);
+}
+
+bool IsMiddleInputSuppressed() {
+    return g_middleSuppressed.load(std::memory_order_acquire);
 }
 
 bool IsWheelInputSuppressed() {

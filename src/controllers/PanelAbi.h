@@ -8,8 +8,10 @@ namespace XBase::Panel::Abi {
 int MountJson(const char* specJson);
 void UnmountName(const char* modId);
 int BindValueRaw(const char* controlId, double (*read)(void*), void (*write)(double, void*), void* userData);
+int BindTextRaw(const char* controlId, int (*read)(char*, std::uint32_t, void*), void (*write)(const char*, void*), void* userData);
 int BindActionRaw(const char* controlId, void (*run)(void*), void* userData);
 void NotifyChangedName(const char* controlId, double value);
+void NotifyTextChangedName(const char* controlId, const char* value);
 int Available();
 void ShowName(const char* modId);
 void HideName();
