@@ -473,7 +473,26 @@ void ReleaseControllerLocked() {
     ActiveState().textureWidth = 0;
     ActiveState().textureHeight = 0;
     ActiveState().previousMouseDown = false;
+    ActiveState().lastForwardedMoveAt = 0;
+    ActiveState().lastForwardedMoveX = 0.0f;
+    ActiveState().lastForwardedMoveY = 0.0f;
+    ActiveState().forwardedMoveValid = false;
+
+    // 销毁异步宿主时，焦点/鼠标捕获不一定会随子窗口同步回到游戏窗口。
+    // 清掉 WebView 注入的输入状态与 ShowCursor 计数，避免下一次回到游戏鼠标失效。
+    if (GetCapture() == ActiveState().hostWindow) {
+        ReleaseCapture();
+    }
+    while (ActiveState().cursorShows > 0) {
+        ShowCursor(FALSE);
+        --ActiveState().cursorShows;
+    }
     DestroyHostWindow();
+    if (ActiveState().gameWindow && IsWindow(ActiveState().gameWindow)
+        && GetFocus() != ActiveState().gameWindow) {
+        SetFocus(ActiveState().gameWindow);
+    }
+    XBase::Detail::Input::Reset();
     ActiveState().initialized = false;
     ActiveState().loading = false;
     ActiveState().canGoBack = false;
