@@ -77,6 +77,16 @@ const fixtures = [
       text('ComboboxEmpty', '没有结果'),
     ]),
   ], { bindings: [binding('test.fruit', 'value', 'onValueChange', 1)] })),
+  component('tree.range', node('Slider', { 'aria-label': '范围', value: [20, 80], min: 0, max: 100, step: 1 }, [], {
+    bindings: [binding('test.range', 'value', 'onValueChange', 3)],
+  })),
+  component('tree.pointer', node('Button', {}, [], {
+    text: '记录点击',
+    bindings: [binding('test.pointer', '', 'onClick', 3)],
+  })),
+  component('tree.parent-disabled', node('div', { disabled: true }, [
+    text('Button', '父级禁用'),
+  ])),
 ]
 
 fixtures.find((item) => item.id === 'tree.dialog').component.children[1].children[1].bindings = [binding('test.action', '', 'onClick', 2)]
@@ -185,4 +195,13 @@ test('图表和桌面窄屏视觉检查', async ({ page }) => {
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
     await page.screenshot({ path: `test-results/panel-${width}.png`, fullPage: true })
   }
+})
+
+test('JSON 数组 事件快照与父级禁用', async ({ page }) => {
+  await page.getByRole('slider', { name: '范围 1', exact: true }).focus()
+  await page.keyboard.press('ArrowRight')
+  await expect.poll(() => page.evaluate(() => window.calls.some((item) => item.method === 'panel.setText' && item.params.id === 'test.range' && item.params.value === '[21,80]'))).toBe(true)
+  await page.getByRole('button', { name: '记录点击' }).click()
+  await expect.poll(() => page.evaluate(() => window.calls.some((item) => item.method === 'panel.setText' && item.params.id === 'test.pointer' && JSON.parse(item.params.value).type === 'click'))).toBe(true)
+  await expect(page.getByRole('button', { name: '父级禁用' })).toBeDisabled()
 })

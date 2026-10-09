@@ -18,6 +18,11 @@ function eventValue(value: unknown): unknown {
     const target = value.currentTarget
     if (target instanceof HTMLInputElement && (target.type === 'checkbox' || target.type === 'radio')) return target.checked
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return target.value
+    const result: Record<string, unknown> = {}
+    for (const key of ['type', 'key', 'code', 'button', 'buttons', 'clientX', 'clientY', 'altKey', 'ctrlKey', 'metaKey', 'shiftKey']) {
+      if (key in value) result[key] = (value as Record<string, unknown>)[key]
+    }
+    return result
   }
   return value
 }
@@ -69,7 +74,9 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
   if (!component) return <p key={path} role="alert" className="text-sm text-destructive">未知组件：{node.component}</p>
   const props = cleanProps(resolveArguments(node.props, scope) as Record<string, unknown> | undefined)
   const disabled = context.disabled || props.disabled === true
+  const childContext = disabled ? { ...context, disabled: true } : context
   if (disabled) props.disabled = true
+  if (node.component === 'Button' && props.type === undefined) props.type = 'button'
 
   for (const binding of node.bindings ?? []) {
     if (binding.kind !== 2 && binding.property) {
@@ -87,7 +94,7 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
           }
         } else if (['checked', 'pressed', 'open'].includes(binding.property)) {
           props[binding.property] = Boolean(value) && value !== '0'
-        } else if (node.component === 'Slider' && binding.property === 'value') {
+        } else if (node.component === 'Slider' && binding.property === 'value' && binding.kind === 0) {
           props.value = [Number(value)]
         } else {
           props[binding.property] = value
@@ -114,7 +121,12 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
         void writeValue(binding.controlId, next)
         return
       }
-      const next = binding.kind === 3 ? JSON.stringify(value ?? null) : value instanceof Date ? localDate(value) : String(value ?? '')
+      let next: string | undefined
+      try {
+        next = binding.kind === 3 ? JSON.stringify(value ?? null) : value instanceof Date ? localDate(value) : String(value ?? '')
+      } catch {
+        return
+      }
       if (next === undefined) return
       context.onTextValue(binding.controlId, next)
       void writeText(binding.controlId, next)
@@ -127,13 +139,13 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
     }
   }
   for (const [name, nodes] of Object.entries(node.slots ?? {})) {
-    const children = nodes.map((child, index) => renderNode(child, context, `${path}.${name}.${index}`, scope))
+    const children = nodes.map((child, index) => renderNode(child, childContext, `${path}.${name}.${index}`, scope))
     props[name] = children.length === 1 ? children[0] : createElement(Fragment, {}, children)
   }
   for (const [name, template] of Object.entries(node.templates ?? {})) {
     if (/^on[A-Z]/.test(name) || ['__proto__', 'constructor', 'ref', 'dangerouslySetInnerHTML'].includes(name)) continue
     props[name] = (argument: unknown) => {
-      const child = renderNode(template, context, `${path}.${name}`, argument)
+      const child = renderNode(template, childContext, `${path}.${name}`, argument)
       if (name === 'render' && isValidElement(child) && typeof argument === 'object' && argument !== null) {
         const element = child as ReactElement<Record<string, unknown>>
         return cloneElement(element, { ...argument, ...element.props })
@@ -142,7 +154,7 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
     }
   }
   props.key = path
-  const children = (node.children ?? []).map((child, index) => renderNode(child, context, `${path}.${index}`, scope))
+  const children = (node.children ?? []).map((child, index) => renderNode(child, childContext, `${path}.${index}`, scope))
   if (text) children.unshift(text)
   return children.length ? createElement(component, props, ...children) : createElement(component, props)
 }

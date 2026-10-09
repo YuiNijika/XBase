@@ -11,7 +11,7 @@ import { DataTable } from './data-table'
 import { ToastButton } from './toast'
 import { Form, FormField } from './form'
 import { Slider } from './slider'
-import { Toaster as SonnerToaster } from '@/components/ui/sonner'
+import { SonnerToaster } from './sonner'
 import { Toaster as BaseToaster } from '@/components/ui/toast'
 
 const modules = import.meta.glob<Record<string, unknown>>('../ui/*.tsx', { eager: true })

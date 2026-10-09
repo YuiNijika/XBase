@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 import { Shell } from '@/components/shell'
 import { SectionList } from '@/components/section'
-import { Toaster } from '@/components/ui/sonner'
+import { SonnerToaster } from '@/components/component-tree/sonner'
 import { callQuiet, componentBindings, fetchSchema, isBridgeAvailable, on, readText, readValue, type PanelMod, type PanelSchema } from '@/lib/bridge'
 
 export default function App() {
@@ -183,7 +183,7 @@ export default function App() {
       onSelectPage={setActivePageId}
       onClose={() => void callQuiet('panel.hide')}
     >
-      <Toaster />
+      <SonnerToaster />
       {activeMod && activePage ? (
         <SectionList
           sections={activePage.sections}
