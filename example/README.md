@@ -84,13 +84,21 @@ extern "C" __declspec(dllexport) void XBasePayloadDetach();
 |---|---|---|
 | 描述界面 | `Panel::Mount(ModSpec)` | 一次提交模组、页面、分区、控件整棵树 |
 | 绑读写 | `Panel::BindValue(id, read, write)` | 开关读写 0 与 1，数值直接读写，下拉读写的是 `options` 下标 |
+| 绑文本 | `Panel::BindText(id, read, write)` | `Text`、`Textarea` 以及 JSON/组件状态使用字符串读写 |
 | 绑动作 | `Panel::BindAction(id, run)` | 按钮点击时触发 |
 | 回推变更 | `Panel::NotifyChanged(id, value)` | 模组自己在游戏里改了状态，让界面跟上 |
-| 开合 | `Panel::Show(modId)` / `Hide()` / `SetHotkey()` | 面板自身的开合与热键 |
+| 回推文本 | `Panel::NotifyTextChanged(id, value)` | 推送文本或 JSON 字符串状态 |
+| 卸载 | `Panel::Unmount(modId)` | 移除该模组的页面和绑定 |
+| 能力检查 | `Panel::IsAvailable()` | 网页视图与面板资源均可用时返回 `true` |
+| 开合 | `Panel::Show(modId)` / `Hide()` / `Toggle()` | 面板自身的开合；`modId` 留空时回到上次打开的模组 |
+| 状态 | `Panel::IsVisible()` | 返回面板当前是否可见 |
+| 热键 | `Panel::SetHotkey()` / `GetHotkey()` | 全局热键由 XBase 固定为 `P`，传入值仅兼容旧版本 |
 
 先 `Mount` 再 `Bind*`：绑定到的控件必须已经在注册表里，顺序反了会返回假并写一条警告日志。
 
 面板热键由共享 XBase 运行时统一轮询，固定为 `P`；模组只需要注册 Host、挂载 Panel 并调用 `SetHotkey()`（传入值仅为旧版本兼容参数）。不要在模组侧重复调用 `Core::Init()`、`Core::Process()` 或 `Core::Shutdown()`。共享运行时会统一驱动 Panel 域和 WebView，多个模组聚合到同一个面板。完整接入方式见 `04-panel/src/main.cpp`。
+
+`Panel::Init()`、`IsInitialized()`、`NotifyGameInit()`、`Process()`、`Shutdown()` 属于共享运行时所有者接口。普通模组不要调用它们；它们由 XBase Core 统一调度。`04-panel/src/runtime_reference.cpp` 仅用于展示运行时所有者在需要时如何调用，不能复制到普通宿主的生命周期里。
 
 ```cpp
 // 值统一是 double，C 接口上因此不必传任何 STL 容器
@@ -98,7 +106,47 @@ XBase::Panel::BindValue(
     "panelsample.scale",
     [] { return gScale; },
     [](double value) { gScale = value; });
+
+XBase::Panel::BindText(
+    "panelsample.notes",
+    [] { return gNotes; },
+    [](const std::string& value) { gNotes = value; });
+
+XBase::Panel::NotifyTextChanged("panelsample.notes", gNotes);
+XBase::Panel::Show("PanelSample");
+XBase::Panel::Hide();
+XBase::Panel::Toggle();
+bool visible = XBase::Panel::IsVisible();
+bool ready = XBase::Panel::IsAvailable();
+XBase::Input::Hotkey hotkey = XBase::Panel::GetHotkey();
 ```
+
+### Component 组件树
+
+`ControlKind::Component` 用 `ComponentNode` 描述 shadcn/ui 组件树，`bindings` 复用既有的 `BindValue`、`BindText`、`BindAction`。`props`、`slots` 和 `templates` 只传可序列化数据，不传裸 JavaScript 函数。
+
+```cpp
+XBase::Panel::Control control;
+control.kind = XBase::Panel::ControlKind::Component;
+control.id = "panelsample.components.enabled";
+control.component.component = "Switch";
+control.component.props.Set("aria-label", "启用");
+control.component.bindings.push_back({
+    "panelsample.components.enabled",
+    "checked",
+    "onCheckedChange",
+    XBase::Panel::ComponentBindingKind::Value
+});
+section.controls.push_back(control);
+
+XBase::Panel::Mount(spec);
+XBase::Panel::BindValue(
+    "panelsample.components.enabled",
+    [] { return enabled ? 1.0 : 0.0; },
+    [](double value) { enabled = value != 0.0; });
+```
+
+`04-panel/src/components.cpp` 是完整示例，覆盖 `Switch`、`Input`、`Slider`、`DatePicker`、`Combobox`、`Dialog`、`Form`、`DataTable` 与 `Chart`，并演示 `Value`、`Text`、`Action`、`Json` 四类绑定。组件树里的 JSON 状态仍通过 `BindText` 与 `NotifyTextChanged` 传递。
 
 控件 `id` 全局唯一，约定按 `模组名.分区.项` 起名。`Control` 上的 `capability` 填 `FeatureCapability`，能力不支持时控件置灰而不是消失；`games` 限定版本；`visibleWhen` 让控件依赖同分区另一个控件，前置 `!` 取反。
 

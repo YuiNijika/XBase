@@ -215,8 +215,7 @@ if /i "%CONFIG%"=="Release" (
     call :stage_panel
 )
 
-rem 查看器与 SDK 一起构建，产物落在 viewer\build\bin\XBase.exe
-call :build_viewer "%CONFIG%"
+rem XBase viewer 已废弃，不再随 SDK 构建或发布。
 
 echo.
 echo Build completed successfully.
@@ -224,31 +223,6 @@ echo Outputs: XBaseBootstrap.lib, XBasePayloadEntry.lib, XBaseSA.lib, XBaseVC.li
 echo           XBaseRuntimeEntry.lib, XBaseModEntry.lib
 echo           XBase\Library\XBaseSA.dll, XBaseVC.dll, XBaseIII.dll
 goto success
-
-rem ============================================================
-rem 构建 XBase 日志与配置查看器
-rem ============================================================
-:build_viewer
-if not exist "viewer\Build.bat" (
-    echo [Warning] viewer\Build.bat not found; viewer was not built.
-    exit /b 0
-)
-if not exist "viewer\src\main.cpp" (
-    echo [Warning] viewer\src\main.cpp not found; viewer was not built.
-    exit /b 0
-)
-echo Building XBase viewer...
-call "viewer\Build.bat" "%~1" --no-pause
-if errorlevel 1 (
-    echo [Warning] XBase viewer build failed; continuing without it.
-    exit /b 0
-)
-if exist "viewer\build\bin\XBase.exe" (
-    echo [Info] XBase viewer built: viewer\build\bin\XBase.exe
-) else (
-    echo [Warning] XBase viewer executable was not produced.
-)
-exit /b 0
 
 rem ============================================================
 rem Stage the Release SDK for every sibling host that consumes it.

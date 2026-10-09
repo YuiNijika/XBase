@@ -305,7 +305,7 @@ custom.styleFile = "ui/custom.css";
 | 只链入口库的宿主 LNK2019 | `Bootstrap.cpp` 引了新 controller，补 premake 的 `ENTRY_SUPPORT_SOURCES` |
 | 面板打不开 | `XBase\Library\panel\index.html` 是否存在，机器上有没有 WebView2 运行时 |
 
-日志在 `XBase\Mods\<模组名>\debug.log`，也可以用 XBase 自带的查看器打开。
+日志在 `XBase\Mods\<模组名>\debug.log`。旧版 XBase viewer 已废弃，不再随 SDK 构建；直接查看日志文件或使用游戏内诊断入口。
 
 ## 文档
 

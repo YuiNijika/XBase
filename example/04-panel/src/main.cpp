@@ -9,6 +9,9 @@
 #include <XBase/Panel.h>
 #include <XBase/Player.h>
 
+#include "components.h"
+
+#include <atomic>
 #include <string>
 
 namespace {
@@ -27,6 +30,30 @@ double g_radio = 1.0;
 double g_flags = 5.0;
 std::string g_title = "PanelSample";
 std::string g_notes = "这里演示 Textarea 与 panel.textChanged。";
+std::string g_status;
+bool g_mounted = false;
+
+enum class PanelCommand {
+    None,
+    Show,
+    Hide,
+    Toggle,
+    Remount,
+    Unmount,
+    Status,
+};
+
+std::atomic<PanelCommand> g_pendingCommand{PanelCommand::None};
+
+void RefreshStatus() {
+    const XBase::Input::Hotkey hotkey = XBase::Panel::GetHotkey();
+    g_status = std::string("Available: ") + (XBase::Panel::IsAvailable() ? "true" : "false")
+        + "\nInitialized in this module: " + (XBase::Panel::IsInitialized() ? "true" : "false")
+        + "\nVisible: " + (XBase::Panel::IsVisible() ? "true" : "false")
+        + "\nHotkey: " + XBase::Input::FormatHotkey(hotkey);
+    XBase::Panel::NotifyTextChanged("panelsample.status", g_status);
+    XBase::Log::Info(g_status);
+}
 
 XBase::Panel::ModSpec BuildSpec() {
     XBase::Panel::ModSpec spec;
@@ -210,6 +237,42 @@ XBase::Panel::ModSpec BuildSpec() {
     page.sections.push_back(tuning);
     page.sections.push_back(actions);
     spec.pages.push_back(page);
+    spec.pages.push_back(PanelSample::Components::BuildPage());
+
+    XBase::Panel::Page management;
+    management.id = "management";
+    management.label = "面板管理";
+    XBase::Panel::Section statusSection;
+    statusSection.id = "status";
+    statusSection.label = "状态";
+    XBase::Panel::Control status;
+    status.kind = XBase::Panel::ControlKind::Textarea;
+    status.id = "panelsample.status";
+    status.label = "运行状态";
+    status.readOnly = true;
+    statusSection.controls.push_back(status);
+    management.sections.push_back(statusSection);
+
+    XBase::Panel::Section commands;
+    commands.id = "commands";
+    commands.label = "操作";
+    commands.columns = 3;
+    commands.inlineLayout = true;
+    for (const XBase::Panel::Option& option : {
+             XBase::Panel::Option{"show", "显示面板"},
+             XBase::Panel::Option{"hide", "隐藏面板"},
+             XBase::Panel::Option{"toggle", "切换显示"},
+             XBase::Panel::Option{"remount", "重新挂载"},
+             XBase::Panel::Option{"unmount", "卸载示例"},
+             XBase::Panel::Option{"status", "刷新状态"}}) {
+        XBase::Panel::Control command;
+        command.kind = XBase::Panel::ControlKind::Action;
+        command.id = "panelsample." + option.value;
+        command.label = option.label;
+        commands.controls.push_back(command);
+    }
+    management.sections.push_back(commands);
+    spec.pages.push_back(management);
     return spec;
 }
 
@@ -321,7 +384,66 @@ bool BindHooks() {
          })
         && ok;
 
-    return ok;
+    ok = XBase::Panel::BindText(
+        "panelsample.status",
+        [] { return g_status; },
+        [](const std::string&) {}) && ok;
+    for (const auto& [id, command] : {
+             std::pair<const char*, PanelCommand>{"show", PanelCommand::Show},
+             {"hide", PanelCommand::Hide},
+             {"toggle", PanelCommand::Toggle},
+             {"remount", PanelCommand::Remount},
+             {"unmount", PanelCommand::Unmount},
+             {"status", PanelCommand::Status}}) {
+        ok = XBase::Panel::BindAction(
+            std::string("panelsample.") + id,
+            [command] { g_pendingCommand.store(command); }) && ok;
+    }
+    return PanelSample::Components::Bind() && ok;
+}
+
+bool MountPanel() {
+    if (!XBase::Panel::IsAvailable()) {
+        XBase::Log::Warn("面板不可用，检查 XBase\\Library\\panel 与网页视图运行时");
+        return false;
+    }
+    if (!XBase::Panel::Mount(BuildSpec())) return false;
+    g_mounted = true;
+    if (!BindHooks()) {
+        XBase::Panel::Unmount(kModName);
+        g_mounted = false;
+        return false;
+    }
+    XBase::Panel::SetHotkey({XBase::Input::Key::F7, 0});
+    RefreshStatus();
+    return true;
+}
+
+void ExecuteCommand() {
+    const PanelCommand command = g_pendingCommand.exchange(PanelCommand::None);
+    if (command == PanelCommand::None) return;
+    switch (command) {
+    case PanelCommand::Show:
+        if (!XBase::Panel::Show(kModName)) XBase::Log::Warn("显示面板请求失败");
+        break;
+    case PanelCommand::Hide:
+        XBase::Panel::Hide();
+        break;
+    case PanelCommand::Toggle:
+        XBase::Panel::Toggle();
+        break;
+    case PanelCommand::Remount:
+        if (!MountPanel()) XBase::Log::Error("重新挂载失败");
+        break;
+    case PanelCommand::Unmount:
+        XBase::Panel::Unmount(kModName);
+        g_mounted = false;
+        break;
+    case PanelCommand::Status:
+    case PanelCommand::None:
+        break;
+    }
+    if (g_mounted) RefreshStatus();
 }
 
 void OnGameInit() {
@@ -331,13 +453,8 @@ void OnGameInit() {
         : std::stod(XBase::Config::GetString(kKeyScale, "1.0"));
     g_mode = std::stod(XBase::Config::GetString(kKeyMode, "1"));
 
-    if (!XBase::Panel::IsAvailable()) {
-        XBase::Log::Warn("面板不可用，检查 XBase\\Library\\panel 与网页视图运行时");
-        return;
-    }
-
     // 先挂载结构再绑钩子，绑定到的控件必须已经在注册表里
-    if (!XBase::Panel::Mount(BuildSpec()) || !BindHooks()) {
+    if (!MountPanel()) {
         XBase::Log::Error("面板挂载失败");
         return;
     }
@@ -346,6 +463,11 @@ void OnGameInit() {
 }
 
 void OnProcess() {
+    // 注册表操作不能在绑定回调持有锁时执行
+    if (XBase::Input::WasPressed(XBase::Input::Key::F6)) {
+        g_pendingCommand.store(PanelCommand::Remount);
+    }
+    ExecuteCommand();
     if (!XBase::Core::IsWorldReady()) return;
     if (!XBase::HasCapability(XBase::FeatureCapability::PlayerProofs)) return;
 
@@ -384,7 +506,9 @@ extern "C" __declspec(dllexport) void XBasePayloadAttach() {
 }
 
 extern "C" __declspec(dllexport) void XBasePayloadDetach() {
-    XBase::Panel::Unmount(kModName);
     XBase::Host::Shutdown();
+    XBase::Panel::Unmount(kModName);
+    g_mounted = false;
+    g_pendingCommand.store(PanelCommand::None);
     XBase::Log::Shutdown();
 }

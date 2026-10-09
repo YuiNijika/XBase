@@ -2,6 +2,13 @@
 setlocal EnableDelayedExpansion
 pushd "%~dp0"
 
+echo [Info] XBase viewer has been deprecated and is no longer built.
+echo [Info] Use XBase\Mods\<mod>\debug.log and the in-game diagnostics instead.
+popd
+exit /b 0
+
+rem Legacy build script retained for source archival only.
+
 set "CONFIG=Release"
 set "NO_PAUSE="
 
