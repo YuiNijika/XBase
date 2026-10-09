@@ -22,7 +22,7 @@ export function Form({ defaultValues = {}, children, onSubmit, className, disabl
 }
 
 function bindFields(children: ReactNode, field: ControllerRenderProps): ReactNode {
-  return Children.map(children, (child) => {
+  const items = Children.map(children, (child) => {
     if (!isValidElement(child)) return child
     const element = child as ReactElement<Record<string, unknown>>
     let props: Record<string, unknown> = {}
@@ -32,6 +32,7 @@ function bindFields(children: ReactNode, field: ControllerRenderProps): ReactNod
     if (element.props.children) props.children = bindFields(element.props.children as ReactNode, field)
     return cloneElement(element, props)
   })
+  return items?.length === 1 ? items[0] : items
 }
 
 export function FormField({ name, rules, children }: { name: string; rules?: RegisterOptions; children?: ReactNode }) {

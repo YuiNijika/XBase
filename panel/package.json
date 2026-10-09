@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "playwright test"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

@@ -10,6 +10,7 @@ import { DatePicker } from './date-picker'
 import { DataTable } from './data-table'
 import { ToastButton } from './toast'
 import { Form, FormField } from './form'
+import { Slider } from './slider'
 import { Toaster as SonnerToaster } from '@/components/ui/sonner'
 import { Toaster as BaseToaster } from '@/components/ui/toast'
 
@@ -30,7 +31,7 @@ Object.assign(registry, {
   PolarRadiusAxis, Radar, RadarChart, RadialBar, RadialBarChart,
   ReferenceArea, ReferenceDot, ReferenceLine, ResponsiveContainer,
   Scatter, ScatterChart, RechartsTooltip, XAxis, YAxis, ZAxis,
-  DatePicker, DataTable, ToastButton, Form, FormField, SonnerToaster, BaseToaster,
+  DatePicker, DataTable, ToastButton, Form, FormField, Slider, SonnerToaster, BaseToaster,
   Toaster: SonnerToaster,
 })
 

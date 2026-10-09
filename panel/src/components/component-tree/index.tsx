@@ -45,6 +45,7 @@ function cleanProps(input: Record<string, unknown> | null | undefined): Record<s
 }
 
 function argumentPath(scope: unknown, path: string): unknown {
+  if (path === '$value') return scope
   let value = scope
   for (const part of path.split('.').filter(Boolean)) {
     if (['__proto__', 'constructor', 'prototype'].includes(part)) return undefined
@@ -72,7 +73,11 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
 
   for (const binding of node.bindings ?? []) {
     if (binding.kind !== 2 && binding.property) {
-      const value = binding.kind === 0 ? context.values[binding.controlId] : context.textValues[binding.controlId]
+      const source = binding.kind === 0 ? context.values[binding.controlId] : context.textValues[binding.controlId]
+      const defaults: Record<string, string> = { value: 'defaultValue', checked: 'defaultChecked', open: 'defaultOpen', pressed: 'defaultPressed' }
+      const defaultProperty = defaults[binding.property]
+      const value = source ?? props[binding.property] ?? props[defaultProperty] ?? (binding.kind === 0 ? 0 : binding.kind === 1 ? '' : undefined)
+      if (defaultProperty) delete props[defaultProperty]
       if (value !== undefined) {
         if (binding.kind === 3 && typeof value === 'string') {
           try {
@@ -81,7 +86,7 @@ function renderNode(node: ComponentNode, context: TreeProps, path: string, scope
             props[binding.property] = node.props?.[binding.property]
           }
         } else if (['checked', 'pressed', 'open'].includes(binding.property)) {
-          props[binding.property] = value !== 0 && value !== '' && value !== '0'
+          props[binding.property] = Boolean(value) && value !== '0'
         } else if (node.component === 'Slider' && binding.property === 'value') {
           props.value = [Number(value)]
         } else {

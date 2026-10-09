@@ -6,3 +6,5 @@ lib/Plugin*.lib
 example/lib/Plugin*.lib
 panel/node_modules/
 panel/dist/
+panel/test-results/
+panel/playwright-report/

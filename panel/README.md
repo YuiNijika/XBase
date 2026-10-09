@@ -28,7 +28,9 @@ npm run build
 
 ## 技术栈
 
-React 19 + Vite + TypeScript + Tailwind 4。不引组件库，开关、拖动条、下拉都用原生元素加 Tailwind 类，装依赖时少一大半包。
+React 19 + Vite + TypeScript + Tailwind 4。官方 shadcn/ui 组件位于 `src/components/ui`，通过官方 CLI 安装，适配逻辑位于 `src/components/component-tree`，不要直接修改官方组件文件。
+
+已安装官方 registry 的 63 个 UI 项，包括 Radix 通用组件、React Aria 专属的 Attachment / Bubble / Marker / Message / Message Scroller / Questionnaire，以及 Base UI Toast。组件公开导出自动加入声明式 registry，不只支持每个文件的主组件，也支持它的 Trigger、Content、Item 等组合部件。
 
 视觉与 XMenu 同源：`--accent-hue` 一个变量派生全部交互色，侧栏图标轨 + 内容区独立滚动 + 右下角拖拽改尺寸 + 标题栏拖拽移动，滚动条与 `prefers-reduced-motion` 的收尾照搬。
 
@@ -63,6 +65,84 @@ React 19 + Vite + TypeScript + Tailwind 4。不引组件库，开关、拖动条
 - `multiselect`：复选组，值是按选项下标编码的 bitmask。
 - `heading` / `separator`：纯布局控件，不需要绑定。
 - `custom`：直接渲染模组提供的 `html`、`style`，并执行 `script`。也可以用 `htmlFile`、`styleFile`、`scriptFile` 从模组目录加载独立资源。
+- `component`：通过 `Control::component` 挂载可嵌套的 shadcn/ui 组件树。
+
+### shadcn/ui 组件树
+
+公共入口是 `ComponentNode` 与 `ComponentBinding`，原来的十四种控件保持兼容。新组件仍然通过原有 JSON ABI 跨模块传递，不跨模块传递 React 对象或 STL 内存。
+
+| 字段 | 内容 |
+|---|---|
+| `component` | 官方公开导出名，例如 `Button`、`DialogTrigger`、`TabsContent` |
+| `text` | 子节点中的纯文本 |
+| `props` | `Json::Value` 对象，传递 `variant`、`className`、数据等可序列化属性 |
+| `children` | 有序子节点；`asChild` 使用单个实际 React 元素，不增加包装层 |
+| `slots` | React 元素属性，例如 ChartTooltip 的 `content` |
+| `templates` | 函数属性模板，例如 ComboboxList 的 `children` 或 AttachmentTrigger 的 `render` |
+| `textPath` | 从模板首个参数取显示文本，点分隔路径；`$value` 表示参数本身 |
+| `bindings` | 属性状态与事件到宿主回调的映射 |
+
+绑定字段为 `controlId`、`property`、`event`、`kind`。节点声明的绑定 ID 会自动登记，挂载成功后再绑定宿主回调即可。
+
+| `ComponentBindingKind` | 宿主绑定 | 行为 |
+|---|---|---|
+| `Value` | `BindValue` | 数值或布尔值；单值 Slider 自动包装为数组 |
+| `Text` | `BindText` | 字符串；适合 Input、Select、Tabs、日期 |
+| `Action` | `BindAction` | 事件只触发动作，`property` 留空 |
+| `Json` | `BindText` | 状态文本解析为 JSON，事件参数序列化为 JSON；适合多选、日期范围、图表数据和表单提交 |
+
+```cpp
+XBase::Panel::Control control;
+control.kind = XBase::Panel::ControlKind::Component;
+control.id = "MyMod.settings.switch";
+control.component.component = "Switch";
+control.component.props.Set("aria-label", "启用功能");
+control.component.bindings.push_back({
+    "MyMod.enabled",
+    "checked",
+    "onCheckedChange",
+    XBase::Panel::ComponentBindingKind::Value
+});
+section.controls.push_back(control);
+
+// 页面与分区先加入模组结构 挂载成功后才能绑定
+if (XBase::Panel::Mount(spec)) {
+    XBase::Panel::BindValue(
+        "MyMod.enabled",
+        [] { return enabled ? 1.0 : 0.0; },
+        [](double value) { enabled = value != 0.0; });
+}
+```
+
+Dialog 使用 Dialog / DialogTrigger / DialogContent / DialogTitle / DialogDescription；Tabs、菜单、Sidebar、Resizable 等同样遵守官方组件的父子关系。必须提供需要的 Provider 和无障碍标签。TooltipProvider 已由每棵组件树提供。
+
+### 组合适配
+
+| 名称 | 属性与事件 |
+|---|---|
+| `DatePicker` | `value` 为本地日期字符串 `YYYY-MM-DD`，`onValueChange` 配合 Text 绑定 |
+| `DataTable` | `columns` 为 `{ key, label }[]`，`data` 为对象数组，支持排序、筛选、分页，`onRowClick` 可配合 Json 绑定 |
+| `Form` | `defaultValues`、`disabled`、`onSubmit`；提交事件配合 Json 绑定 |
+| `FormField` | `name`、可序列化 `rules` 和子节点；自动给 Input / Textarea / Select / RadioGroup / Checkbox / Switch 接入表单状态 |
+| `ToastButton` | `title`、`description`、`variant`、`engine`，点击显示通知 |
+| `SonnerToaster` / `Toaster` | Sonner 通知容器，面板已挂载一份，通常无需重复声明 |
+| `BaseToaster` | Base UI 通知容器，内部 ToastButton 使用 `engine=base` |
+
+ChartContainer 内可直接声明 Recharts 的 AreaChart、BarChart、LineChart、PieChart、RadarChart、RadialBarChart、ScatterChart、ComposedChart 及其轴、图元、图例。Tooltip 的 `content` 使用 slots，图表数据可通过 Json 绑定刷新。
+
+模板属性中的 `{ "$arg": "label" }` 从回调首个参数取属性，空路径表示参数本身。模板 `textPath="$value"` 显示整个参数，例如 ComboboxList 的字符串项。模板不可覆盖事件处理器，事件仍由 bindings 描述。
+
+### 边界与验证
+
+支持全部已安装的 UI 组件，并不意味着 C++ 可以序列化任意 JavaScript 函数。函数子节点使用 templates，元素属性使用 slots；复杂的前端业务逻辑、hooks 或自定义解析器仍应使用 Custom 或独立 WebView。`props` 中的事件处理器、裸 ref 和直接 HTML 注入不会执行。
+
+未知组件和不合法组合会在局部显示错误，不让整张面板白屏。能力门控与只读状态会阻止声明式绑定写回，JSON 解析失败保留该属性的声明值。业务校验仍由宿主完成。
+
+```bash
+npm test
+```
+
+测试使用本机 Edge，自动启动并关闭本地 Vite 服务，覆盖 registry、旧控件、数值与文本桥接、推送、弹层、表单验证、日期、模板集合、表格、通知、图表与桌面和窄屏布局。
 
 `custom.script` 接收 `(root, xbase)` 两个参数。`xbase` 提供 `call`、`get`、`set`、`getText`、`setText`、`run`、`on`，例如：
 

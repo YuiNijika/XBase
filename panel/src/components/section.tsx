@@ -10,7 +10,7 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Checkbox } from '@/components/ui/checkbox'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Progress } from '@/components/ui/progress'
-import { Slider } from '@/components/ui/slider'
+import { Slider } from '@/components/component-tree/slider'
 import { Separator } from '@/components/ui/separator'
 
 type SectionListProps = {

@@ -6,6 +6,8 @@ export default defineConfig({
     baseURL: 'http://127.0.0.1:5175',
     channel: 'msedge',
     headless: true,
+    locale: 'zh-CN',
+    timezoneId: 'Asia/Shanghai',
   },
   webServer: {
     command: 'npm run dev -- --host 127.0.0.1 --port 5175 --strictPort',

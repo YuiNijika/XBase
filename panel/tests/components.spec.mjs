@@ -111,6 +111,7 @@ test.beforeEach(async ({ page }) => {
   }, { controls: fixtures })
   await page.goto('/')
   await expect(page.getByRole('switch', { name: '旧版开关' })).toBeVisible()
+  await expect(page.getByText('组件配置无效')).toHaveCount(0)
 })
 
 test('完整组件 registry 与旧控件兼容', async ({ page }) => {
